@@ -214,6 +214,14 @@ protected:
                                                 ObSchemaGetterGuard *schema_guard,
                                                 const common::ObIArray<ObAssignment> &assigns,
                                                 bool &update_with_vector_index);
+  // Resetting an AI column to NULL also rewrites the vector column, so a vector
+  // index on it needs the same hidden vid refresh as an explicit assignment.
+  int check_ai_invalidate_with_vector_index(const ObTableSchema *table_schema,
+                                            ObSchemaGetterGuard *schema_guard,
+                                            uint64_t table_id,
+                                            bool trigger_exist,
+                                            const common::ObIArray<ObAssignment> &assigns,
+                                            bool &update_with_vector_index);
 protected:
   int generate_insert_table_info(const TableItem &table_item,
                                  ObInsertTableInfo &table_info,

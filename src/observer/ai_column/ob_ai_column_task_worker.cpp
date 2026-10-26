@@ -215,9 +215,14 @@ int ObAiColumnTaskWorker::load_pending_tasks(ObIAllocator &allocator,
   } else if (OB_FAIL(sql.append_fmt(
                  "select table_id, column_id, task_id, request_id, "
                  "rowkey_predicate, retry_count from %s "
-                 "where state = %ld and eligible_ts <= now(6) "
+                 // A failed attempt parks the task in state 3, so the retry only
+                 // happens if that state is eligible here too; selecting on
+                 // state = 0 alone would strand every retry forever.
+                 "where state in (%ld, %ld) and eligible_ts <= now(6) "
                  "order by eligible_ts, request_id limit %ld",
-                 OB_ALL_AI_COLUMN_TASK_TNAME, TASK_STATE_PENDING, limit))) {    LOG_WARN("ai column worker: build select failed", K(ret));
+                 OB_ALL_AI_COLUMN_TASK_TNAME, TASK_STATE_PENDING, TASK_STATE_RETRY,
+                 limit))) {
+    LOG_WARN("ai column worker: build select failed", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       sqlclient::ObMySQLResult *result = nullptr;

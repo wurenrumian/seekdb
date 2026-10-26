@@ -481,6 +481,46 @@ int ObDelUpdResolver::check_update_vector_col_with_vector_index(const ObTableSch
   return ret;
 }
 
+int ObDelUpdResolver::check_ai_invalidate_with_vector_index(const ObTableSchema *table_schema,
+                                                            ObSchemaGetterGuard *schema_guard,
+                                                            uint64_t table_id,
+                                                            bool trigger_exist,
+                                                            const common::ObIArray<ObAssignment> &assigns,
+                                                            bool &update_with_vector_index)
+{
+  int ret = OB_SUCCESS;
+  if (update_with_vector_index) {
+    // already concluded below
+  } else if (OB_ISNULL(table_schema) || OB_ISNULL(schema_guard)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && !update_with_vector_index && iter != table_schema->column_end();
+         ++iter) {
+      const ObColumnSchemaV2 *column_schema = *iter;
+      bool need_assigned = false;
+      bool ai_invalidate = false;
+      ObIndexType index_type = INDEX_TYPE_MAX;
+      if (OB_ISNULL(column_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (!column_schema->is_ai_column()) {
+        // only an AI column can be implicitly reset by this statement
+      } else if (OB_FAIL(check_need_assignment(assigns, table_id, trigger_exist,
+                                               *column_schema, need_assigned,
+                                               ai_invalidate))) {
+      } else if (!need_assigned || !ai_invalidate) {
+        // the statement does not reset this AI column
+      } else if (OB_FAIL(ObVectorIndexUtil::check_column_has_vector_index(
+                     *table_schema, *schema_guard, column_schema->get_column_id(),
+                     update_with_vector_index, index_type))) {
+        LOG_WARN("ai column: check vector index on ai column failed", K(ret),
+                 K(column_schema->get_column_id()));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment> &assigns,
                                                      const ObStmtScope scope)
 {
@@ -517,6 +557,12 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                                                  schema_guard,
                                                                  assigns.at(i).assignments_,
                                                                  update_with_vector_index))) {
+    } else if (OB_FAIL(check_ai_invalidate_with_vector_index(table_schema,
+                                                             schema_guard,
+                                                             table_item->table_id_,
+                                                             trigger_exist,
+                                                             assigns.at(i).assignments_,
+                                                             update_with_vector_index))) {
     } else {
       for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
           (OB_SUCCESS == ret && iter != table_schema->column_end()); ++iter) {
