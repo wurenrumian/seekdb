@@ -3453,10 +3453,29 @@ int ObAlterTableResolver::resolve_add_column(const ParseNode &node, ObColumnName
           }
         }
 
+        // ai column: build the three internal hidden columns. Their column ids are
+        // assigned by RS (sequential ++max_used_column_id), so keep OB_INVALID_ID.
+        ObSEArray<ObColumnSchemaV2, 3> ai_hidden_columns;
+        if (OB_SUCC(ret) && alter_column_schema.is_ai_column()) {
+          if (OB_FAIL(build_ai_hidden_columns(alter_column_schema, ai_hidden_columns))) {
+          } else if (OB_FAIL(alter_column_schema.clear_ai_column_spec())) {
+          }
+        }
         //add column
         if (OB_SUCC(ret)) {
           if (OB_FAIL(alter_table_stmt->add_column(alter_column_schema))) {
           } else if (FALSE_IT(alter_table_stmt->set_sql_mode(session_info_->get_sql_mode()))) {
+          }
+        }
+        for (int64_t k = 0; OB_SUCC(ret) && k < ai_hidden_columns.count(); ++k) {
+          AlterColumnSchema hidden_alter_column;
+          if (OB_FAIL(hidden_alter_column.assign(ai_hidden_columns.at(k)))) {
+          } else if (OB_FAIL(hidden_alter_column.set_origin_column_name(
+                       hidden_alter_column.get_column_name_str()))) {
+          } else {
+            hidden_alter_column.alter_type_ = OB_DDL_ADD_COLUMN;
+            if (OB_FAIL(alter_table_stmt->add_column(hidden_alter_column))) {
+            }
           }
         }
       }

@@ -539,6 +539,11 @@ protected:
   int resolve_normal_column_attribute_check_cons(ObColumnSchemaV2 &column,
                                                  ParseNode *attrs_node,
                                                  ObCreateTableStmt *create_table_stmt);
+  /* ai column */
+  int resolve_ai_column_attribute(share::schema::ObColumnSchemaV2 &column,
+                                  ParseNode *attr_node);
+  int build_ai_hidden_columns(const share::schema::ObColumnSchemaV2 &ai_column,
+                              common::ObIArray<share::schema::ObColumnSchemaV2> &hidden_columns);
   int resolve_normal_column_attribute_foreign_key(ObColumnSchemaV2 &column,
                                                   ParseNode *attrs_node,
                                                   ObCreateTableStmt *create_table_stmt);

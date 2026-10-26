@@ -50,6 +50,37 @@ const char *const STR_COLUMN_TYPE_RAW = "raw";
 const char *const STR_COLUMN_TYPE_UNKNOWN = "unknown";
 
 class ObTableSchema;
+
+// AI column related definitions
+const char *const AI_COLUMN_SPEC_PREFIX = "ai_col:";
+const char *const AI_STATE_COLUMN_NAME_PREFIX = "__ai_state_";
+const char *const AI_REQUEST_COLUMN_NAME_PREFIX = "__ai_req_";
+const char *const AI_RESULT_SPEC_COLUMN_NAME_PREFIX = "__ai_spec_";
+// byte length of the internal __ai_req_/__ai_spec_ hidden columns (varchar)
+const int32_t AI_HIDDEN_COLUMN_LENGTH = 16384;
+
+struct ObAiColumnSpec
+{
+  common::ObString func_name_;   // ai_complete / ai_embed
+  common::ObString model_name_;  // model name
+  common::ObString sync_mode_;   // async
+  common::ObString owner_name_;  // user visible ai column name
+  common::ObString expr_;        // normalized prompt expression text
+  int64_t max_retries_;
+  int64_t embed_dim_;            // -1 means not specified
+  ObAiColumnSpec() { reset(); }
+  void reset()
+  {
+    func_name_.reset();
+    model_name_.reset();
+    sync_mode_.reset();
+    owner_name_.reset();
+    expr_.reset();
+    max_retries_ = 0;
+    embed_dim_ = -1;
+  }
+};
+
 class ObColumnSchemaV2 : public ObSchema
 {
   OB_UNIS_VERSION_V(1);
@@ -194,6 +225,26 @@ int assign(const ObColumnSchemaV2 &src_schema);
   inline bool is_zero_fill() const { return is_zero_fill_; }
   inline bool is_autoincrement() const { return is_autoincrement_; }
   inline bool is_hidden() const { return is_hidden_; }
+  /* ai column */
+  inline bool is_ai_column() const { return column_flags_ & AI_COLUMN_FLAG; }
+  inline bool is_ai_state_column() const { return column_flags_ & AI_STATE_COLUMN_FLAG; }
+  inline bool is_ai_request_column() const { return column_flags_ & AI_REQUEST_COLUMN_FLAG; }
+  inline bool is_ai_result_spec_column() const { return column_flags_ & AI_RESULT_SPEC_COLUMN_FLAG; }
+  inline bool is_ai_hidden_column() const
+  {
+    return is_ai_state_column() || is_ai_request_column() || is_ai_result_spec_column();
+  }
+  int set_ai_column_spec(const common::ObString &spec);
+  int get_ai_column_spec(common::ObString &spec) const;
+  int clear_ai_column_spec();
+  static int parse_ai_column_spec(const common::ObString &spec, ObAiColumnSpec &parsed);
+  static int get_ai_result_type_prompt(const common::ObObjType type, common::ObString &prompt);
+  static int gen_ai_hidden_column_name(const common::ObString &owner_name,
+                                       const bool is_state,
+                                       const bool is_request,
+                                       char *buf,
+                                       const int64_t buf_len,
+                                       common::ObString &name);
   inline bool is_string_type() const { return meta_type_.is_string_type(); }
   inline bool is_json() const { return meta_type_.is_json(); }
   inline bool is_geometry() const { return meta_type_.is_geometry(); }

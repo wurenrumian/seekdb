@@ -125,6 +125,14 @@ public:
                            const ObTableSchema &new_table_schema,
                            const ObColumnSchemaV2 &column_schema,
                            const bool record_ddl_operation);
+  /* ai column metadata (__all_ai_column) */
+  int add_ai_column_meta(common::ObISQLClient &sql_client,
+                         const ObTableSchema &table,
+                         const ObColumnSchemaV2 &ai_column);
+  int delete_ai_column_meta(common::ObISQLClient &sql_client,
+                            const uint64_t table_id);
+  int add_ai_columns_for_create_table(common::ObISQLClient &sql_client,
+                                      const ObIArray<ObTableSchema> &tables);
   //alter table add constraint
   int insert_single_constraint(common::ObISQLClient &sql_client,
                            const ObTableSchema &new_table_schema,

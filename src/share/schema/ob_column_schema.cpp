@@ -518,6 +518,172 @@ int ObColumnSchemaV2::add_type_info(const ObString &type_info)
   return add_string_to_array(type_info, extended_type_info_);
 }
 
+int ObColumnSchemaV2::set_ai_column_spec(const common::ObString &spec)
+{
+  int ret = OB_SUCCESS;
+  const int64_t prefix_len = static_cast<int64_t>(strlen(AI_COLUMN_SPEC_PREFIX));
+  common::ObIAllocator *allocator = get_allocator();
+  if (spec.empty() || NULL == spec.ptr()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_ISNULL(allocator)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("column schema allocator is null", K(ret));
+  } else {
+    const int64_t total_len = prefix_len + spec.length();
+    char *buf = static_cast<char *>(allocator->alloc(total_len + 1));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      MEMCPY(buf, AI_COLUMN_SPEC_PREFIX, prefix_len);
+      MEMCPY(buf + prefix_len, spec.ptr(), spec.length());
+      buf[total_len] = '\0';
+      ObString prefixed(static_cast<int32_t>(total_len), buf);
+      if (OB_FAIL(add_type_info(prefixed))) {
+      }
+    }
+  }
+  return ret;
+}
+
+static int64_t parse_ai_spec_int(const char *ptr, const int64_t len)
+{
+  int64_t value = 0;
+  int64_t i = 0;
+  while (i < len && (ptr[i] >= '0' && ptr[i] <= '9')) {
+    value = value * 10 + (ptr[i] - '0');
+    ++i;
+  }
+  return value;
+}
+
+int ObColumnSchemaV2::get_ai_column_spec(common::ObString &spec) const
+{
+  int ret = OB_SUCCESS;
+  const int64_t prefix_len = static_cast<int64_t>(strlen(AI_COLUMN_SPEC_PREFIX));
+  spec.reset();
+  for (int64_t i = 0; OB_SUCC(ret) && i < extended_type_info_.count(); ++i) {
+    const ObString &cur = extended_type_info_.at(i);
+    if (cur.length() > prefix_len
+        && 0 == strncmp(cur.ptr(), AI_COLUMN_SPEC_PREFIX, prefix_len)) {
+      spec.assign_ptr(cur.ptr() + prefix_len, cur.length() - prefix_len);
+      break;
+    }
+  }
+  return ret;
+}
+
+int ObColumnSchemaV2::clear_ai_column_spec()
+{
+  int ret = OB_SUCCESS;
+  const int64_t prefix_len = static_cast<int64_t>(strlen(AI_COLUMN_SPEC_PREFIX));
+  ObSEArray<common::ObString, 4> kept_type_info;
+  for (int64_t i = 0; OB_SUCC(ret) && i < extended_type_info_.count(); ++i) {
+    const ObString &cur = extended_type_info_.at(i);
+    bool is_ai_spec = (cur.length() > prefix_len
+                       && 0 == strncmp(cur.ptr(), AI_COLUMN_SPEC_PREFIX, prefix_len));
+    if (!is_ai_spec && OB_FAIL(kept_type_info.push_back(cur))) {
+    }
+  }
+  if (OB_SUCC(ret) && kept_type_info.count() != extended_type_info_.count()) {
+    ret = set_extended_type_info(kept_type_info);
+  }
+  return ret;
+}
+
+int ObColumnSchemaV2::get_ai_result_type_prompt(const common::ObObjType type,
+                                                common::ObString &prompt)
+{
+  int ret = OB_SUCCESS;
+  prompt.reset();
+  if (ob_is_json_tc(type)) {
+    prompt = ObString::make_string("Return exactly one valid JSON value.");
+  } else if (ob_is_integer_type(type)) {
+    prompt = ObString::make_string("Return exactly one base-10 integer.");
+  }
+  return ret;
+}
+
+int ObColumnSchemaV2::parse_ai_column_spec(const common::ObString &spec, ObAiColumnSpec &parsed){
+  int ret = OB_SUCCESS;
+  parsed.reset();
+  if (spec.empty() || NULL == spec.ptr()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const char *start = spec.ptr();
+    const int64_t len = static_cast<int64_t>(spec.length());
+    int64_t pos = 0;
+    while (OB_SUCC(ret) && pos < len) {
+      int64_t line_end = pos;
+      while (line_end < len && start[line_end] != '\n') {
+        ++line_end;
+      }
+      const int64_t line_len = line_end - pos;
+      int64_t eq = -1;
+      for (int64_t i = 0; i < line_len; ++i) {
+        if ('=' == start[pos + i]) {
+          eq = i;
+          break;
+        }
+      }
+      if (eq > 0) {
+        const ObString key(static_cast<int32_t>(eq), start + pos);
+        const ObString value(static_cast<int32_t>(line_len - eq - 1), start + pos + eq + 1);
+        if (0 == key.case_compare("func")) {
+          parsed.func_name_ = value;
+        } else if (0 == key.case_compare("model")) {
+          parsed.model_name_ = value;
+        } else if (0 == key.case_compare("sync")) {
+          parsed.sync_mode_ = value;
+        } else if (0 == key.case_compare("retries")) {
+          parsed.max_retries_ = parse_ai_spec_int(value.ptr(), value.length());
+        } else if (0 == key.case_compare("dim")) {
+          parsed.embed_dim_ = parse_ai_spec_int(value.ptr(), value.length());
+        } else if (0 == key.case_compare("owner")) {
+          parsed.owner_name_ = value;
+        } else if (0 == key.case_compare("expr")) {
+          // expr is the last line, may contain newlines
+          parsed.expr_.assign_ptr(start + pos + eq + 1, static_cast<int32_t>(len - pos - eq - 1));
+          pos = len;
+          break;
+        } else {
+          // ignore unknown key
+        }
+      }
+      pos = line_end + 1;
+    }
+  }
+  return ret;
+}
+
+int ObColumnSchemaV2::gen_ai_hidden_column_name(const common::ObString &owner_name,
+                                                const bool is_state,
+                                                const bool is_request,
+                                                char *buf,
+                                                const int64_t buf_len,
+                                                common::ObString &name)
+{
+  int ret = OB_SUCCESS;
+  const char *prefix = is_state ? AI_STATE_COLUMN_NAME_PREFIX
+                     : (is_request ? AI_REQUEST_COLUMN_NAME_PREFIX
+                                   : AI_RESULT_SPEC_COLUMN_NAME_PREFIX);
+  const int64_t prefix_len = static_cast<int64_t>(strlen(prefix));
+  name.reset();
+  if (OB_ISNULL(buf) || buf_len <= 0 || owner_name.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (prefix_len + owner_name.length() >= buf_len) {
+    ret = OB_ERR_TOO_LONG_IDENT;
+  } else {
+    int64_t pos = 0;
+    MEMCPY(buf, prefix, prefix_len);
+    pos += prefix_len;
+    MEMCPY(buf + pos, owner_name.ptr(), owner_name.length());
+    pos += owner_name.length();
+    buf[pos] = '\0';
+    name.assign_ptr(buf, static_cast<int32_t>(pos));
+  }
+  return ret;
+}
+
 int ObColumnSchemaV2::convert_column_id(const hash::ObHashMap<uint64_t, uint64_t> &column_id_map)
 {
   int ret = OB_SUCCESS;

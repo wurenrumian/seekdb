@@ -633,6 +633,9 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
     // Store the column schema after resolve_column_definition in resolved_cols
     // To support generating columns in any order, all column_schema are generated first and then uniformly stored in table_schema
     ObSEArray<ObColumnSchemaV2, SEARRAY_INIT_NUM> resolved_cols;
+    // hidden columns of ai columns, added after all user visible columns so that
+    // their column ids are larger than every user column id.
+    ObSEArray<ObColumnSchemaV2, 6> ai_hidden_columns;
     // Resolve column names with the runtime name-case mode.
     //RESOLVE_NON_COL needs to add the columns in the query to stats in order to resolve PK constraint information etc.
     if (OB_FAIL(ret)) {
@@ -819,6 +822,19 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
             }
           }
 
+          // AI column: build the three internal hidden columns before the user
+          // visible column is copied into the table schema. The AI spec lives in
+          // the hidden columns' extended_type_info only; the result column keeps
+          // a clean extended_type_info (a vector(n) result column must keep
+          // exactly one "VECTOR(n)" entry).
+          if (OB_SUCC(ret) && column.is_ai_column()) {
+            ObSEArray<ObColumnSchemaV2, 3> hidden_columns;
+            if (OB_FAIL(build_ai_hidden_columns(column, hidden_columns))) {
+            } else if (OB_FAIL(column.clear_ai_column_spec())) {
+            } else if (OB_FAIL(append(ai_hidden_columns, hidden_columns))) {
+            }
+          }
+
           if (OB_SUCC(ret)) {
             ObColumnSchemaV2 *tmp_col = NULL;
             if (OB_FAIL(table_schema.add_column(column))) {
@@ -833,6 +849,7 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
               }
             }
           }
+
 
           if (OB_SUCC(ret) && !column.is_invisible_column()) {
             has_visible_col = true;
@@ -881,6 +898,14 @@ int ObCreateTableResolver::resolve_table_elements(const ParseNode *node,
         // won't be here
         ret = OB_ERR_UNEXPECTED;
         SQL_RESV_LOG(WARN, "unexpected branch", K(ret));
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ai_hidden_columns.count(); ++i) {
+        ai_hidden_columns.at(i).set_column_id(gen_column_id());
+        if (OB_FAIL(resolved_cols.push_back(ai_hidden_columns.at(i)))) {
+        }
       }
     }
 

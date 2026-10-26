@@ -1045,7 +1045,11 @@ int ObSchemaRetrieveUtils::fill_column_schema(const bool check_deleted, T &resul
       ret = fill_column_schema_default_value<T>(result, column, default_type);
     }
 
-    if (OB_SUCC(ret) && (column.is_enum_or_set() || column.is_collection())) {
+    // AI spec is persisted in extended_type_info of the three hidden columns only.
+    // The user visible AI column keeps its own extended_type_info untouched (a
+    // vector(n) AI column must keep exactly one "VECTOR(n)" entry).
+    if (OB_SUCC(ret) && (column.is_enum_or_set() || column.is_collection()
+                         || column.is_ai_hidden_column())) {
       ObString extend_type_info;
       EXTRACT_VARCHAR_FIELD_MYSQL(result, "extended_type_info", extend_type_info);
       int64_t pos = 0;

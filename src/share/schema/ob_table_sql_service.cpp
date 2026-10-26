@@ -694,6 +694,7 @@ int ObTableSqlService::drop_table(const ObTableSchema &table_schema,
                        sql_client, table_id,
                        table_schema.get_column_count(),
                        true))) {
+    } else if (OB_FAIL(delete_ai_column_meta(sql_client, table_id))) {
     }
   }
 
@@ -889,6 +890,21 @@ int ObTableSqlService::insert_single_column(
   if (OB_FAIL(check_ddl_allowed(new_table_schema))) {
   } else if (OB_FAIL(add_single_column(sql_client, new_column_schema))) {
   }
+  // the ai column metadata row is generated when its result spec hidden column
+  // is inserted, at that point the user visible column and all hidden columns
+  // already exist in new_table_schema.
+  if (OB_SUCC(ret) && new_column_schema.is_ai_result_spec_column()) {
+    ObString spec;
+    ObAiColumnSpec parsed;
+    const ObColumnSchemaV2 *ai_column = NULL;
+    if (OB_FAIL(new_column_schema.get_ai_column_spec(spec))) {
+    } else if (OB_FAIL(ObColumnSchemaV2::parse_ai_column_spec(spec, parsed))) {
+    } else if (OB_ISNULL(ai_column = new_table_schema.get_column_schema(parsed.owner_name_))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ai column not found", K(ret), K(parsed.owner_name_));
+    } else if (OB_FAIL(add_ai_column_meta(sql_client, new_table_schema, *ai_column))) {
+    }
+  }
   if (OB_SUCC(ret)) {
     if (new_column_schema.is_autoincrement()) {
       if (OB_FAIL(add_sequence(sql_client,
@@ -912,6 +928,124 @@ int ObTableSqlService::insert_single_column(
   return ret;
 }
 
+static int get_ai_hidden_column_schema(const ObTableSchema &table,
+                                       const ObString &owner_name,
+                                       const bool is_state,
+                                       const bool is_request,
+                                       const ObColumnSchemaV2 *&hidden_column)
+{
+  int ret = OB_SUCCESS;
+  char name_buf[OB_MAX_COLUMN_NAME_LENGTH];
+  ObString hidden_name;
+  hidden_column = NULL;
+  MEMSET(name_buf, 0, OB_MAX_COLUMN_NAME_LENGTH);
+  if (OB_FAIL(ObColumnSchemaV2::gen_ai_hidden_column_name(
+                owner_name, is_state, is_request, name_buf, OB_MAX_COLUMN_NAME_LENGTH, hidden_name))) {
+  } else if (OB_ISNULL(hidden_column = table.get_column_schema(hidden_name))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai hidden column not found", K(ret), K(owner_name), K(hidden_name));
+  }
+  return ret;
+}
+
+int ObTableSqlService::add_ai_column_meta(common::ObISQLClient &sql_client,
+                                          const ObTableSchema &table,
+                                          const ObColumnSchemaV2 &ai_column)
+{
+  int ret = OB_SUCCESS;
+  const ObColumnSchemaV2 *state_column = NULL;
+  const ObColumnSchemaV2 *request_column = NULL;
+  const ObColumnSchemaV2 *spec_column = NULL;
+  ObString spec;
+  ObAiColumnSpec parsed;
+  const ObString &owner_name = ai_column.get_column_name_str();
+  if (!ai_column.is_ai_column()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(get_ai_hidden_column_schema(table, owner_name, true, false, state_column))) {
+  } else if (OB_FAIL(get_ai_hidden_column_schema(table, owner_name, false, true, request_column))) {
+  } else if (OB_FAIL(get_ai_hidden_column_schema(table, owner_name, false, false, spec_column))) {
+  } else if (OB_FAIL(spec_column->get_ai_column_spec(spec))) {
+  } else if (OB_UNLIKELY(spec.empty())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column spec is empty", K(ret), K(owner_name));
+  } else if (OB_FAIL(ObColumnSchemaV2::parse_ai_column_spec(spec, parsed))) {
+  } else {
+    ObSqlString normalized_expr;
+    ObString type_prompt;
+    if (OB_FAIL(ObColumnSchemaV2::get_ai_result_type_prompt(ai_column.get_data_type(), type_prompt))) {
+    } else if (!type_prompt.empty() && OB_FAIL(normalized_expr.append_fmt("%.*s\n",
+                                               type_prompt.length(), type_prompt.ptr()))) {
+    } else if (OB_FAIL(normalized_expr.append(parsed.expr_))) {
+    } else {
+      ObDMLSqlSplicer dml;
+      ObDMLExecHelper exec(sql_client);
+      int64_t affected_rows = 0;
+      const uint64_t table_id = table.get_table_id();
+      if (OB_FAIL(dml.add_pk_column("table_id",
+              ObSchemaUtils::get_extract_schema_id(table_id)))
+          || OB_FAIL(dml.add_pk_column("column_id", ai_column.get_column_id()))
+          || OB_FAIL(dml.add_column("column_name", ObHexEscapeSqlStr(owner_name)))
+          || OB_FAIL(dml.add_column("func_name", ObHexEscapeSqlStr(parsed.func_name_)))
+          || OB_FAIL(dml.add_column("model_name", ObHexEscapeSqlStr(parsed.model_name_)))
+          || OB_FAIL(dml.add_column("sync_mode", ObHexEscapeSqlStr(parsed.sync_mode_)))
+          || OB_FAIL(dml.add_column("max_retries", parsed.max_retries_))
+          || OB_FAIL(dml.add_column("state_column_id", state_column->get_column_id()))
+          || OB_FAIL(dml.add_column("request_column_id", request_column->get_column_id()))
+          || OB_FAIL(dml.add_column("result_spec_column_id", spec_column->get_column_id()))
+          || OB_FAIL(dml.add_column("normalized_expr", ObHexEscapeSqlStr(normalized_expr.string())))
+          || OB_FAIL(dml.add_gmt_create())
+          || OB_FAIL(dml.add_gmt_modified())) {
+      } else if (OB_FAIL(exec_insert(sql_client, table_id, OB_ALL_AI_COLUMN_TNAME, dml, affected_rows))) {
+      } else if (!is_single_row(affected_rows)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected affected rows for ai column meta", K(ret), K(affected_rows));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableSqlService::delete_ai_column_meta(common::ObISQLClient &sql_client,
+                                             const uint64_t table_id)
+{
+  int ret = OB_SUCCESS;
+  if (!is_core_table(table_id)) {
+    ObDMLSqlSplicer dml;
+    if (OB_FAIL(dml.add_pk_column("table_id", ObSchemaUtils::get_extract_schema_id(table_id)))) {
+    } else {
+      int64_t affected_rows = 0;
+      if (OB_FAIL(exec_delete(sql_client, table_id, OB_ALL_AI_COLUMN_TNAME, dml, affected_rows))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableSqlService::add_ai_columns_for_create_table(common::ObISQLClient &sql_client,
+                                                       const ObIArray<ObTableSchema> &tables)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < tables.count(); ++i) {
+    const ObTableSchema &table = tables.at(i);
+    if (is_inner_table(table.get_table_id())
+        || table.is_index_table()
+        || table.is_view_table()) {
+      // ai column only exists on user tables
+      continue;
+    }
+    ObTableSchema::const_column_iterator iter = table.column_begin();
+    for (; OB_SUCC(ret) && iter != table.column_end(); ++iter) {
+      const ObColumnSchemaV2 *column = *iter;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (column->is_ai_column()
+                 && OB_FAIL(add_ai_column_meta(sql_client, table, *column))) {
+      }
+    }
+  }
+  return ret;
+}
+
 int ObTableSqlService::update_single_column(
     ObISQLClient &sql_client,
     const ObTableSchema &origin_table_schema,
@@ -919,8 +1053,7 @@ int ObTableSqlService::update_single_column(
     const ObColumnSchemaV2 &new_column_schema,
     const bool record_ddl_operation,
     const bool need_del_stats)
-{
-  int ret = OB_SUCCESS;
+{  int ret = OB_SUCCESS;
   
   
   const uint64_t table_id = new_column_schema.get_table_id();
@@ -2151,6 +2284,8 @@ int ObTableSqlService::batch_create_table(ObIArray<ObTableSchema> &tables,
     } else if (FALSE_IT(time_guard.click("insert_all_table"))) {
     } else if (OB_FAIL(batch_add_columns_for_create_table(sql_client, tables))) {
     } else if (FALSE_IT(time_guard.click("insert_all_column"))) {
+    } else if (OB_FAIL(add_ai_columns_for_create_table(sql_client, tables))) {
+    } else if (FALSE_IT(time_guard.click("insert_all_ai_column"))) {
     } else if (OB_FAIL(batch_add_constraints_for_create_table(sql_client, tables))) {
     } else if (FALSE_IT(time_guard.click("insert_all_cst"))) {
     } else if (OB_FAIL(batch_add_table_part_info(sql_client, tables))) {
@@ -3170,7 +3305,10 @@ int ObTableSqlService::gen_column_dml_without_check(
       cur_default_value.reset();
     }
     ObString bin_extended_type_info;
-    if (OB_SUCC(ret) && (column.is_enum_or_set() || column.is_collection())) {
+    // AI spec is persisted in extended_type_info of the three hidden columns only,
+    // see ob_schema_retrieve_utils.ipp for the reason.
+    if (OB_SUCC(ret) && (column.is_enum_or_set() || column.is_collection()
+                         || column.is_ai_hidden_column())) {
       int64_t pos = 0;
       extended_type_info_buf = static_cast<char *>(allocator.alloc(OB_MAX_VARBINARY_LENGTH));
       if (OB_ISNULL(extended_type_info_buf)) {
