@@ -44,6 +44,26 @@ namespace oceanbase
 namespace storage
 {
 
+// CS_TYPE_UTF8MB4_BIN compares as (memcmp on the common prefix, then length),
+// which is exactly what ob_strnncoll_mb_bin does. The dictionary range
+// boundaries are always compared with that collation, so call it directly and
+// skip the three layers ObCharset::strcmp adds per comparison
+// (is_argument_valid -> get_charset_uninit -> get_charset).
+static inline int ft_bin_cmp(const ObString &l, const ObString &r)
+{
+  const int64_t l_len = l.length();
+  const int64_t r_len = r.length();
+  const int64_t common = l_len < r_len ? l_len : r_len;
+  int cmp = 0;
+  if (common > 0) {
+    cmp = MEMCMP(l.ptr(), r.ptr(), common);
+  }
+  if (0 != cmp) {
+    return cmp;
+  }
+  return static_cast<int>(l_len - r_len);
+}
+
 
 int ObFTRangeDict::build_cache_from_ik_dict(const ObFTDictDesc &desc, ObFTCacheRangeContainer &range_container)
 {
@@ -307,6 +327,22 @@ int ObFTRangeDict::init()
     ret = OB_INIT_TWICE;
   } else {
     if (OB_FAIL(build_dict_from_cache(*range_container_))) {
+    } else {
+      // Range boundaries come from a sorted dictionary iterator and are cut every
+      // DEFAULT_KEY_PER_RANGE entries, so they should be strictly ascending and
+      // disjoint. Binary search is only equivalent to the linear scan when both
+      // hold (disjointness guarantees at most one candidate), so verify once
+      // here and fall back to scanning otherwise.
+      ranges_ascending_ = true;
+      for (int64_t i = 1; i < range_dicts_.size(); ++i) {
+        if (ft_bin_cmp(range_dicts_[i - 1].start_.get_word(),
+                       range_dicts_[i].start_.get_word()) >= 0
+            || ft_bin_cmp(range_dicts_[i - 1].end_.get_word(),
+                          range_dicts_[i].start_.get_word()) >= 0) {
+          ranges_ascending_ = false;
+          break;
+        }
+      }
     }
     is_inited_ = true;
   }
@@ -382,17 +418,35 @@ int ObFTRangeDict::find_first_char_range(const ObString &single_word, ObIFTDict 
 {
   int ret = OB_SUCCESS;
   bool found = false;
-  for (int i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
-    if (ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                          range_dicts_[i].start_.get_word(),
-                          single_word)
-            <= 0
-        && ObCharset::strcmp(ObCollationType::CS_TYPE_UTF8MB4_BIN,
-                             range_dicts_[i].end_.get_word(),
-                             single_word)
-               >= 0) {
-      dict = range_dicts_[i].dict_;
+
+  // The range boundaries are produced by walking a sorted dictionary iterator
+  // and cutting every DEFAULT_KEY_PER_RANGE entries. init() verified they are
+  // strictly ascending and disjoint, which makes the binary search below exactly
+  // equivalent to a linear scan. Otherwise we fall back to scanning.
+  if (ranges_ascending_ && range_dicts_.size() > 0) {
+    int64_t lo = 0;
+    int64_t hi = range_dicts_.size();
+    // upper_bound: first range whose start_ > single_word
+    while (lo < hi) {
+      int64_t mid = lo + ((hi - lo) >> 1);
+      if (ft_bin_cmp(range_dicts_[mid].start_.get_word(), single_word) <= 0) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    const int64_t idx = lo - 1;
+    if (idx >= 0 && ft_bin_cmp(range_dicts_[idx].end_.get_word(), single_word) >= 0) {
+      dict = range_dicts_[idx].dict_;
       found = true;
+    }
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && !found && i < range_dicts_.size(); ++i) {
+      if (ft_bin_cmp(range_dicts_[i].start_.get_word(), single_word) <= 0
+          && ft_bin_cmp(range_dicts_[i].end_.get_word(), single_word) >= 0) {
+        dict = range_dicts_[i].dict_;
+        found = true;
+      }
     }
   }
   if (!found) {

@@ -31,6 +31,14 @@ namespace oceanbase
 {
 namespace storage
 {
+int ObIIKProcessor::process(TokenizeContext &ctx,
+                            const char *ch,
+                            const uint8_t char_len,
+                            const ObFTCharUtil::CharType type)
+{
+  return do_process(ctx, ch, char_len, type);
+}
+
 int ObIIKProcessor::process(TokenizeContext &ctx)
 {
   int ret = OB_SUCCESS;
