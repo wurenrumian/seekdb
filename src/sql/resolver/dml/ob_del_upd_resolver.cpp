@@ -558,6 +558,10 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
               ObDefaultValueUtils utils(stmt, &params_, this);
               if (OB_FAIL(utils.build_now_expr(col_item, assignment.expr_))) {
               }
+            } else if (column_schema->is_ai_column()) {
+              // stale derived value: reset to NULL, the worker regenerates it
+              if (OB_FAIL(ObRawExprUtils::build_null_expr(*params_.expr_factory_, assignment.expr_))) {
+              }
             } else if (column_schema->is_generated_column()) {
               if (OB_FAIL(copy_schema_expr(*params_.expr_factory_,
                                            col_item->expr_->get_dependant_expr(),
@@ -734,6 +738,71 @@ int ObDelUpdResolver::check_need_assignment(const common::ObIArray<ObAssignment>
     } else if (OB_FAIL(ObResolverUtils::check_whether_assigned(stmt, assigns, table_id, column.get_column_id(), exist))) {
     } else if (!exist) {
       need_assign = true;
+    }
+  }
+  // An AI column holds a derived value: whenever any column referenced by its
+  // prompt expression changes, the stored result is stale and must be reset to
+  // NULL (the background worker regenerates it). Assigning the result column
+  // explicitly in the statement wins over this implicit reset.
+  if (OB_SUCC(ret) && !need_assign && column.is_ai_column()) {
+    // The visible AI column only carries AI_COLUMN_FLAG; the spec (and hence
+    // the reference list) lives on the hidden columns. A vector result column
+    // must keep exactly one "VECTOR(n)" entry in extended_type_info, so the
+    // spec cannot be duplicated here.
+    const ObTableSchema *table_schema = NULL;
+    const ObColumnSchemaV2 *state_column = NULL;
+    ObString spec;
+    ObAiColumnSpec parsed;
+    ObString ref_columns;
+    char name_buf[OB_MAX_COLUMN_NAME_LENGTH];
+    ObString hidden_name;
+    if (OB_ISNULL(schema_checker_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(schema_checker_->get_table_schema(column.get_table_id(), table_schema))) {
+      // The schema may still be invisible to the guard (e.g. the table was
+      // created in this very statement). In that case there is no stored AI
+      // result to invalidate, so silently skip instead of failing the DML.
+      LOG_ERROR("ai column: no table schema, skip invalidation", K(ret), K(column.get_table_id()));
+      ret = OB_SUCCESS;
+      table_schema = NULL;
+    } else if (OB_ISNULL(table_schema)) {
+      // same as above
+    } else if (OB_FAIL(ObColumnSchemaV2::gen_ai_hidden_column_name(
+                 column.get_column_name_str(), true, false,
+                 name_buf, OB_MAX_COLUMN_NAME_LENGTH, hidden_name))) {
+    } else if (OB_ISNULL(state_column = table_schema->get_column_schema(hidden_name))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ai state hidden column not found", K(ret), K(hidden_name));
+    } else if (OB_FAIL(state_column->get_ai_column_spec(spec))) {
+    } else if (OB_FAIL(ObColumnSchemaV2::parse_ai_column_spec(spec, parsed))) {
+    } else if (FALSE_IT(ref_columns = parsed.ref_columns_)) {
+    } else if (ref_columns.empty()) {
+      // no column reference: nothing can invalidate the result
+    } else if (OB_FAIL(ObResolverUtils::check_whether_assigned(stmt, assigns, table_id,
+                                                               column.get_column_id(), exist))) {
+    } else if (exist) {
+      // the statement assigns the AI column itself
+    } else {
+      const int64_t len = static_cast<int64_t>(ref_columns.length());
+      const char *ptr = ref_columns.ptr();
+      int64_t pos = 0;
+      while (OB_SUCC(ret) && !need_assign && pos < len) {
+        int64_t end = pos;
+        while (end < len && ',' != ptr[end]) {
+          ++end;
+        }
+        const ObString ref_name(static_cast<int32_t>(end - pos), ptr + pos);
+        const ObColumnSchemaV2 *ref_column = NULL;
+        if (!ref_name.empty()
+            && OB_NOT_NULL(ref_column = table_schema->get_column_schema(ref_name))) {
+          if (OB_FAIL(ObResolverUtils::check_whether_assigned(stmt, assigns, table_id,
+                                                             ref_column->get_column_id(), exist))) {
+          } else if (exist) {
+            need_assign = true;
+          }
+        }
+        pos = end + 1;
+      }
     }
   }
   return ret;

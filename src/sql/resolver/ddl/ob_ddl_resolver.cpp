@@ -2515,6 +2515,7 @@ int ObDDLResolver::resolve_ai_column_attribute(ObColumnSchemaV2 &column,
     }
   }
   // the prompt expression of an ai column can not reference another ai column
+  ObSqlString ref_column_list;
   if (OB_SUCC(ret)) {
     ObSEArray<ObString, 4> ref_columns;
     const ObTableSchema *table_schema = NULL;
@@ -2530,6 +2531,10 @@ int ObDDLResolver::resolve_ai_column_attribute(ObColumnSchemaV2 &column,
         ret = OB_NOT_SUPPORTED;
         SQL_RESV_LOG(WARN, "ai column can not depend on ai column",
                      K(ref_columns.at(i)), K(ret));
+      } else if (OB_FAIL(ref_column_list.append_fmt("%.*s%s",
+                                                    ref_columns.at(i).length(),
+                                                    ref_columns.at(i).ptr(),
+                                                    0 == ref_column_list.length() ? "" : ","))) {
       }
     }
   }
@@ -2544,7 +2549,7 @@ int ObDDLResolver::resolve_ai_column_attribute(ObColumnSchemaV2 &column,
     const char *raw_expr_ptr = expr_node->str_value_;
     if (OB_ISNULL(raw_expr_ptr)) {
       ret = OB_ERR_UNEXPECTED;
-    } else if (OB_FAIL(spec.append_fmt("func=%s\nmodel=%.*s\nsync=%.*s\nretries=%ld\ndim=%ld\nowner=%.*s\nexpr=%.*s",
+    } else if (OB_FAIL(spec.append_fmt("func=%s\nmodel=%.*s\nsync=%.*s\nretries=%ld\ndim=%ld\nowner=%.*s\nrefs=%.*s\nexpr=%.*s",
                                        canonical_func,
                                        model_name.length(), model_name.ptr(),
                                        sync_mode.length(), sync_mode.ptr(),
@@ -2552,6 +2557,7 @@ int ObDDLResolver::resolve_ai_column_attribute(ObColumnSchemaV2 &column,
                                        embed_dim,
                                        column.get_column_name_str().length(),
                                        column.get_column_name_str().ptr(),
+                                       ref_column_list.length(), ref_column_list.ptr(),
                                        raw_expr_len, raw_expr_ptr))) {
     } else if (OB_FAIL(column.set_ai_column_spec(spec.string()))) {
     } else {

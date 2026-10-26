@@ -640,6 +640,8 @@ int ObColumnSchemaV2::parse_ai_column_spec(const common::ObString &spec, ObAiCol
           parsed.embed_dim_ = parse_ai_spec_int(value.ptr(), value.length());
         } else if (0 == key.case_compare("owner")) {
           parsed.owner_name_ = value;
+        } else if (0 == key.case_compare("refs")) {
+          parsed.ref_columns_ = value;
         } else if (0 == key.case_compare("expr")) {
           // expr is the last line, may contain newlines
           parsed.expr_.assign_ptr(start + pos + eq + 1, static_cast<int32_t>(len - pos - eq - 1));

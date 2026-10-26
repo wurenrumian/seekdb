@@ -66,6 +66,9 @@ struct ObAiColumnSpec
   common::ObString sync_mode_;   // async
   common::ObString owner_name_;  // user visible ai column name
   common::ObString expr_;        // normalized prompt expression text
+  // comma separated user column names referenced by the prompt expression.
+  // A DML that changes any of them invalidates the generated result.
+  common::ObString ref_columns_;
   int64_t max_retries_;
   int64_t embed_dim_;            // -1 means not specified
   ObAiColumnSpec() { reset(); }
@@ -76,6 +79,7 @@ struct ObAiColumnSpec
     sync_mode_.reset();
     owner_name_.reset();
     expr_.reset();
+    ref_columns_.reset();
     max_retries_ = 0;
     embed_dim_ = -1;
   }
