@@ -111,6 +111,11 @@ private:
   int get_max_retries(uint64_t table_id, uint64_t column_id, int64_t &max_retries);
   // Remove the task rows of a group once it is resolved.
   int remove_task_group(const TaskGroup &group);
+  // Claim a request id for this round. A model call is slow enough that the
+  // timer can fire again while a previous round is still publishing the same
+  // request; running it twice would duplicate model calls.
+  bool try_claim(int64_t request_id);
+  void release_claim(int64_t request_id);
   // Record a failed attempt: bump retry_count and mark the task for retry, or
   // drop it when the retry budget is exhausted.
   int handle_failure(const TaskGroup &group, int64_t max_retries, int fail_ret);
@@ -118,6 +123,12 @@ private:
 private:
   bool is_inited_;
   common::ObTimer timer_;
+  // Request ids currently being regenerated. The timer can fire again while a
+  // previous round is still publishing (a model call is slow), and running the
+  // same request twice would both duplicate model calls and let an older result
+  // overwrite a newer one.
+  common::ObSEArray<int64_t, 16> in_flight_;
+  common::SpinRWLock in_flight_lock_;
   DISALLOW_COPY_AND_ASSIGN(ObAiColumnTaskWorker);
 };
 

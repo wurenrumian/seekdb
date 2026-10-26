@@ -148,11 +148,13 @@ void ObAiColumnTaskWorker::runTimerTask()
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < groups.count(); ++i) {
       const TaskGroup &group = groups.at(i);
+      if (!try_claim(group.request_id_)) {
+        // Another round is still publishing this request.
+        continue;
+      }
       int tmp_ret = regenerate_group(group, allocator);
       if (OB_SUCCESS == tmp_ret) {
-        // Diagnostic: keep the task row for now so the recorded statement and
-        // the outcome can be inspected from SQL.
-        if (false && OB_FAIL(remove_task_group(group))) {
+        if (OB_FAIL(remove_task_group(group))) {
           LOG_WARN("ai column worker: remove task group failed", K(ret));
         }
       } else if (group.column_ids_.empty()) {
@@ -170,7 +172,32 @@ void ObAiColumnTaskWorker::runTimerTask()
           }
         }
         LOG_WARN("ai column worker: regenerate failed", K(tmp_ret), K(group.request_id_));
-      }    }
+      }
+      release_claim(group.request_id_);
+    }
+  }
+}
+
+bool ObAiColumnTaskWorker::try_claim(const int64_t request_id)
+{
+  bool claimed = false;
+  common::SpinWLockGuard guard(in_flight_lock_);
+  if (!has_exist_in_array(in_flight_, request_id)) {
+    if (OB_SUCCESS == in_flight_.push_back(request_id)) {
+      claimed = true;
+    }
+  }
+  return claimed;
+}
+
+void ObAiColumnTaskWorker::release_claim(const int64_t request_id)
+{
+  common::SpinWLockGuard guard(in_flight_lock_);
+  for (int64_t i = 0; i < in_flight_.count(); ++i) {
+    if (in_flight_.at(i) == request_id) {
+      in_flight_.remove(i);
+      break;
+    }
   }
 }
 
@@ -190,8 +217,7 @@ int ObAiColumnTaskWorker::load_pending_tasks(ObIAllocator &allocator,
                  "rowkey_predicate, retry_count from %s "
                  "where state = %ld and eligible_ts <= now(6) "
                  "order by eligible_ts, request_id limit %ld",
-                 OB_ALL_AI_COLUMN_TASK_TNAME, TASK_STATE_PENDING, limit))) {
-    LOG_WARN("ai column worker: build select failed", K(ret));
+                 OB_ALL_AI_COLUMN_TASK_TNAME, TASK_STATE_PENDING, limit))) {    LOG_WARN("ai column worker: build select failed", K(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       sqlclient::ObMySQLResult *result = nullptr;
@@ -386,8 +412,6 @@ int ObAiColumnTaskWorker::regenerate_group(const TaskGroup &group,
   } else if (OB_ISNULL(table)) {
     ret = OB_TABLE_NOT_EXIST;
   }
-  LOG_INFO("ai column worker: regenerate begin", K(ret), K(full_name),
-           K(group.rowkey_predicate_), K(group.column_ids_), K(group.request_id_));
   // One statement assigns every AI column of the group, so a reader never sees a
   // partially regenerated row.
   for (int64_t i = 0; OB_SUCC(ret) && i < group.column_ids_.count(); ++i) {
@@ -421,18 +445,11 @@ int ObAiColumnTaskWorker::regenerate_group(const TaskGroup &group,
   } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
     LOG_WARN("ai column worker: write regenerated value failed", K(ret), K(sql));
     ret = OB_ERR_UNEXPECTED;
-  } else {
-    LOG_INFO("ai column worker: statement done", K(affected_rows), K(sql));
-    // Diagnostic: encode the outcome into retry_count, an integer column, so it
-    // is readable even when writing the LOB error_message silently fails.
-    ObSqlString diag;
-    int64_t diag_rows = 0;
-    if (OB_SUCC(diag.append_fmt("update %s set retry_count = %ld "
-                                "where request_id = %ld",
-                                OB_ALL_AI_COLUMN_TASK_TNAME,
-                                affected_rows, group.request_id_))) {
-      sql_proxy->write(diag.ptr(), diag_rows);
-    }
+  } else if (0 == affected_rows) {
+    // The row is gone, or it never matched: either way nothing was published, so
+    // the task must not be reported as done.
+    LOG_WARN("ai column worker: update touched no row", K(group.rowkey_predicate_));
+    ret = OB_ERR_UNEXPECTED;
   }
   return ret;
 }
@@ -467,8 +484,8 @@ int ObAiColumnTaskWorker::handle_failure(const TaskGroup &group,
   } else if (group.retry_count_ >= max_retries) {
     // Retry budget exhausted: the result stays NULL and the task is dropped, so
     // a terminal failure does not spin forever.
-    if (false && OB_FAIL(sql.append_fmt("delete from %s where request_id = %ld",
-                                        OB_ALL_AI_COLUMN_TASK_TNAME, group.request_id_))) {
+    if (OB_FAIL(sql.append_fmt("delete from %s where request_id = %ld",
+                               OB_ALL_AI_COLUMN_TASK_TNAME, group.request_id_))) {
     }
   } else {
     // Visible as state=3 with an incremented retry_count, which is what the

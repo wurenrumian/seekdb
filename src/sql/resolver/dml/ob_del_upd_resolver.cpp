@@ -788,6 +788,22 @@ int ObDelUpdResolver::check_need_assignment(const common::ObIArray<ObAssignment>
     } else if (exist) {
       // the statement assigns the AI column itself
     } else {
+      // A row's identity changed, so the stored result belongs to a row that no
+      // longer exists: it must be regenerated for the new key.
+      const ObRowkeyInfo &rowkey_info = table_schema->get_rowkey_info();
+      for (int64_t i = 0; OB_SUCC(ret) && !need_assign && i < rowkey_info.get_size(); ++i) {
+        uint64_t rowkey_column_id = OB_INVALID_ID;
+        if (OB_FAIL(rowkey_info.get_column_id(i, rowkey_column_id))) {
+          LOG_WARN("ai column: get rowkey column id failed", K(ret), K(i));
+        } else if (OB_FAIL(ObResolverUtils::check_whether_assigned(
+                     stmt, assigns, table_id, rowkey_column_id, exist))) {
+        } else if (exist) {
+          need_assign = true;
+          ai_invalidate = true;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !need_assign && !ref_columns.empty()) {
       const int64_t len = static_cast<int64_t>(ref_columns.length());
       const char *ptr = ref_columns.ptr();
       int64_t pos = 0;
