@@ -2474,6 +2474,42 @@ all_ai_column_def = dict(
 )
 def_table_schema(**all_ai_column_def)
 
+# Pending AI column generation tasks.
+#
+# One row per (table, owning AI column, target row). Rows are written in the
+# same transaction as the user DML so that `select ... from
+# oceanbase.__all_ai_column_task` inside an explicit transaction sees them and a
+# rollback removes them. The background worker consumes them after commit.
+#
+# `request_id` groups all tasks of one row-level change so that a group of AI
+# columns can publish atomically. `rowkey_predicate` is the human readable
+# primary key predicate of the target row (`\`id\` = 2`), which is what the
+# acceptance tests inspect.
+all_ai_column_task_def = dict(
+    owner = 'seekdb',
+    table_name = '__all_ai_column_task',
+    table_id = '1132',
+    table_type = 'SYSTEM_TABLE',
+    gm_columns = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+      ('table_id', 'int'),
+      ('column_id', 'int'),
+      ('task_id', 'int')
+    ],
+
+    is_cluster_private = False,
+    meta_record_in_sys = False,
+    normal_columns = [
+        ('request_id', 'int', 'false'),
+        ('rowkey_predicate', 'varchar:1024', 'true'),
+        ('eligible_ts', 'timestamp:6', 'false'),
+        ('state', 'int', 'false', 0),
+        ('retry_count', 'int', 'false', 0),
+        ('error_message', 'longtext', 'true')
+    ]
+)
+def_table_schema(**all_ai_column_task_def)
+
 
 all_objauth_mysql_def = dict(
     owner = 'cjl476581',
