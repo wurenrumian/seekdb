@@ -353,6 +353,13 @@ public:
    virtual ~ObAIFuncModel() {}
    // completion
    int call_completion(ObString &prompt, ObJsonObject *config, ObString &result);
+   // Same, with an explicit system message. `prompt` is the user content; the
+   // AI column path uses `system_prompt` for the result type hint so the model
+   // knows whether to answer with JSON, an integer, etc.
+   int call_completion(ObString &prompt,
+                       ObString &system_prompt,
+                       ObJsonObject *config,
+                       ObString &result);
    int call_completion_vector(ObArray<ObString> &prompts, ObJsonObject *config, ObArray<ObString> &results);
    // dense_embedding
    int call_dense_embedding(ObString &content, ObJsonObject *config, ObString &result);
@@ -379,8 +386,16 @@ public:
   static bool is_valid_prompt_object(ObJsonObject* prompt_object);
   static int replace_all_str_args_in_template(ObIAllocator &allocator, ObJsonObject* prompt_object, ObString& replaced_prompt_str);
   static int construct_prompt_object(ObIAllocator &allocator, ObString &template_str, ObJsonArray *args_array, ObJsonObject *&prompt_object);
+  // Read and drop the "system" entry from an AI_COMPLETE() config object.
+  //
+  // The config is the last argument of AI_COMPLETE(), which callers use to
+  // steer the model. `system` is consumed here rather than forwarded, because
+  // "system" is a meaningful OpenAI body field that must be filled from this
+  // dedicated slot and not merged blindly into the request.
+  static int get_system_prompt_from_config(ObJsonObject &config, ObString &system_prompt);
   static constexpr char prompt_template_key[20] = "template";
   static constexpr char prompt_args_key[20] = "args";
+  static constexpr char system_prompt_key[10] = "system";
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncPromptObjectUtils);
 };

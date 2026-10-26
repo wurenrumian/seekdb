@@ -53,15 +53,45 @@ int ObAiService::init()
   int ret = OB_SUCCESS;
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
+  } else if (OB_FAIL(ai_column_timer_.init("AiColumnWorker"))) {
+    LOG_WARN("init ai column timer failed", K(ret));
+  } else if (OB_FAIL(ai_column_worker_.init())) {
+    LOG_WARN("init ai column worker failed", K(ret));
   } else {
     is_inited_ = true;
   }
   return ret;
 }
 
+int ObAiService::start()
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ai_column_worker_.start(ai_column_timer_))) {
+    LOG_WARN("start ai column worker failed", K(ret));
+  }
+  return ret;
+}
+
+void ObAiService::stop()
+{
+  ai_column_worker_.stop(ai_column_timer_);
+}
+
+void ObAiService::wait()
+{
+  ai_column_timer_.stop();
+  ai_column_timer_.wait();
+}
+
 void ObAiService::destroy()
 {
-  is_inited_ = false;
+  if (is_inited_) {
+    ai_column_timer_.destroy();
+    ai_column_worker_.destroy();
+    is_inited_ = false;
+  }
 }
 
 int ObAiService::get_ai_service_guard(ObAiServiceGuard &ai_service_guard)

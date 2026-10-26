@@ -143,6 +143,15 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
       res.set_null();
     }
 
+    // An AI column declares the shape of its result, so the model has to be told
+    // what to answer. The hint travels as the system message; a plain
+    // AI_COMPLETE() call in a query leaves it empty.
+    ObString system_prompt;
+    if (OB_FAIL(ret)) {
+    } else if (OB_NOT_NULL(config)) {
+      ObAIFuncPromptObjectUtils::get_system_prompt_from_config(*config, system_prompt);
+    }
+
     if (OB_FAIL(ret)){
     } else if (OB_FAIL(ObAIFuncUtils::get_ai_func_info(temp_allocator, model_id, info))) {
     } else if (OB_ISNULL(endpoint_resolver)) {
@@ -152,7 +161,7 @@ int ObExprAIComplete::eval_ai_complete(const ObExpr &expr,
     } else {
       ObAIFuncModel model(temp_allocator, *info, *endpoint_info);
       ObString result;
-      if (OB_FAIL(model.call_completion(prompt, config, result))) {
+      if (OB_FAIL(model.call_completion(prompt, system_prompt, config, result))) {
       } else if (OB_FAIL(ObAIFuncUtils::set_string_result(expr, ctx, res, result))) {
       }
     }

@@ -1286,13 +1286,21 @@ int ObAIFuncUtils::get_ai_func_info(ObIAllocator &allocator, const ObString &mod
 
 int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObString &result)
 {
+  ObString no_system_prompt;
+  return call_completion(prompt, no_system_prompt, config, result);
+}
+
+int ObAIFuncModel::call_completion(ObString &prompt,
+                                   ObString &system_prompt,
+                                   ObJsonObject *config,
+                                   ObString &result)
+{
   int ret = OB_SUCCESS;
   ObArray<ObString> headers;
   ObJsonObject *body = nullptr;
   ObJsonObject *response = nullptr;
   ObIJsonBase *result_base = nullptr;
   ObAIFuncIComplete *complete_provider = nullptr;
-  ObString prompt_str;
   ObString result_str;
   ObAIFuncClient client;
   ObString unencrypted_access_key;
@@ -1303,7 +1311,7 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
   } else if (OB_FAIL(ObAIFuncUtils::get_complete_provider(*allocator_, endpoint_info_.get_provider(), complete_provider))) {
   } else if (OB_FAIL(endpoint_info_.get_unencrypted_access_key(*allocator_, unencrypted_access_key))) {
   } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
-  } else if (OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, prompt_str, prompt, config, body))) {
+  } else if (OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, system_prompt, prompt, config, body))) {
   } else if (OB_FAIL(client.send_post(*allocator_, endpoint_info_.get_url(), headers, body, response))) {
   } else if (OB_FAIL(complete_provider->parse_output(*allocator_, response, result_base))) {
   } else if (OB_FAIL(ObAIFuncJsonUtils::print_json_to_str(*allocator_, result_base, result_str))) {
@@ -1602,6 +1610,29 @@ bool ObAIFuncPromptObjectUtils::is_valid_prompt_object(ObJsonObject *prompt_obje
     }
   }
   return is_valid;
+}
+
+int ObAIFuncPromptObjectUtils::get_system_prompt_from_config(ObJsonObject &config,
+                                                             ObString &system_prompt)
+{
+  int ret = OB_SUCCESS;
+  ObJsonNode *system_node = nullptr;
+  system_prompt.reset();
+  if (OB_ISNULL(system_node = config.get_value(system_prompt_key))) {
+    // No hint configured: the model gets the user message only.
+  } else if (ObJsonNodeType::J_STRING != system_node->json_type()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "ai_complete, config system must be a string");
+  } else {
+    system_prompt = ObString(static_cast<int32_t>(system_node->get_data_length()),
+                             system_node->get_data());
+    // Consumed here, so it must not be merged into the request body as a stray
+    // top-level field.
+    if (OB_FAIL(config.remove(system_prompt_key))) {
+      LOG_WARN("failed to remove system from ai_complete config", K(ret));
+    }
+  }
+  return ret;
 }
 
 int ObAIFuncPromptObjectUtils::replace_all_str_args_in_template(ObIAllocator &allocator, ObJsonObject* prompt_object, ObString& replaced_prompt_str)

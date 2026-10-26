@@ -37,7 +37,7 @@ struct ObAIFuncExprInfo : public ObIExprExtraInfo
 public:
   ObAIFuncExprInfo(common::ObIAllocator &alloc, ObExprOperatorType type)
       : ObIExprExtraInfo(alloc, type), 
-        name_(), type_(), model_()
+        name_(), type_(), model_(), result_type_prompt_()
   {
   }
   virtual ~ObAIFuncExprInfo() {}
@@ -46,6 +46,7 @@ public:
     name_.reset();
     type_ = share::EndpointType::MAX_TYPE;
     model_.reset();
+    result_type_prompt_.reset();
   }
   virtual int deep_copy(common::ObIAllocator &allocator,
                         const ObExprOperatorType type,
@@ -54,6 +55,11 @@ public:
   common::ObString name_;
   share::EndpointType::TYPE type_;
   common::ObString model_;
+  // System message the model must see when this expression computes an AI
+  // column, e.g. "Return exactly one valid JSON value." for a JSON column or
+  // "Return exactly one base-10 integer." for an integer column. Empty for a
+  // plain AI_COMPLETE() call in a query.
+  common::ObString result_type_prompt_;
 };
 
 class ObAIFuncBase 
