@@ -421,6 +421,11 @@ private:
                                      const uint64_t table_id,
                                      const IndexDMLInfo &index_dml_info,
                                      ObDASDMLBaseCtDef &das_dml_ctdef);
+  // Detect whether a DML on this table may need to enqueue AI column
+  // regeneration tasks (i.e. the table declares at least one AI column).
+  int check_table_has_ai_column(ObLogicalOperator &op,
+                                const uint64_t table_id,
+                                bool &has_ai_column);
 private:
   int generate_table_loc_meta(const IndexDMLInfo &index_dml_info, ObDASTableLocMeta &loc_meta);
 private:

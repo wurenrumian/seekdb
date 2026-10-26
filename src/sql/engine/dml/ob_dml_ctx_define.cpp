@@ -182,6 +182,7 @@ OB_SERIALIZE_MEMBER(ColumnContent,
                     column_name_,
                     is_nullable_,
                     is_implicit_,
+                    is_ai_invalidate_,
                     is_predicate_column_,
                     srs_id_);
 
@@ -201,7 +202,8 @@ OB_SERIALIZE_MEMBER(ObDMLBaseCtDef,
                     is_table_without_pk_, // FARM COMPAT WHITELIST, renamed
                     reserved_advanced_trigger_,
                     trans_info_expr_,
-                    is_vec_hnsw_index_vid_opt_);
+                    is_vec_hnsw_index_vid_opt_,
+                    has_ai_column_);
 
 OB_SERIALIZE_MEMBER(ObMultiInsCtDef,
                     calc_part_id_expr_,

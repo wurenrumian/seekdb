@@ -2107,6 +2107,17 @@ int ObDmlCgService::generate_dml_base_ctdef(ObLogicalOperator &op,
     }
   }
 
+  // A DML on a table with AI columns may need to enqueue regeneration tasks for
+  // the rows it touches. Only the primary index ctdef drives the enqueue, so
+  // index maintenance passes do not duplicate tasks.
+  if (OB_SUCC(ret) && index_dml_info.is_primary_index_) {
+    bool has_ai_column = false;
+    if (OB_FAIL(check_table_has_ai_column(op, index_dml_info.ref_table_id_, has_ai_column))) {
+    } else {
+      dml_base_ctdef.has_ai_column_ = has_ai_column;
+    }
+  }
+
   if (OB_SUCC(ret) &&
       op.is_dml_operator() &&
       OB_NOT_NULL(index_dml_info.trans_info_expr_)) {
@@ -2486,6 +2497,7 @@ int ObDmlCgService::convert_upd_assign_infos(bool is_heap_table,
     column_content.is_predicate_column_ = assigns.at(i).is_predicate_column_;
     column_content.srs_id_ = col->get_srs_id();
     column_content.is_implicit_ = assigns.at(i).is_implicit_;
+    column_content.is_ai_invalidate_ = assigns.at(i).is_ai_invalidate_;
     if (is_heap_table &&
         assigns.at(i).expr_->get_expr_type() == T_TABLET_AUTOINC_NEXTVAL) {
       // skip it
@@ -3316,6 +3328,35 @@ int ObDmlCgService::get_domain_index_col_ids(
         ret = OB_ERR_UNEXPECTED;
       } else if (OB_FAIL(domain_id_col_ids.push_back(col_ids))) {
       } else if (OB_FAIL(append(flatten_domain_id_col_ids, col_ids))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDmlCgService::check_table_has_ai_column(ObLogicalOperator &op,
+                                              const uint64_t table_id,
+                                              bool &has_ai_column)
+{
+  int ret = OB_SUCCESS;
+  ObLogPlan *log_plan = op.get_plan();
+  ObSchemaGetterGuard *schema_guard = nullptr;
+  const ObTableSchema *table_schema = nullptr;
+  has_ai_column = false;
+  if (OB_ISNULL(log_plan) ||
+      OB_ISNULL(schema_guard = log_plan->get_optimizer_context().get_schema_guard())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_guard->get_table_schema( table_id, table_schema))) {
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    for (ObTableSchema::const_column_iterator iter = table_schema->column_begin();
+         OB_SUCC(ret) && !has_ai_column && iter != table_schema->column_end(); ++iter) {
+      const ObColumnSchemaV2 *column = *iter;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (column->is_ai_column()) {
+        has_ai_column = true;
       }
     }
   }

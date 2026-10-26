@@ -83,7 +83,8 @@ protected:
                             uint64_t table_id,
                             bool before_update_row_trigger_exist,
                             const share::schema::ObColumnSchemaV2 &column,
-                            bool &need_assign);
+                            bool &need_assign,
+                            bool &ai_invalidate);
 
   int set_base_table_for_updatable_view(TableItem &table_item,
                                         const ObColumnRefRawExpr &col_ref,

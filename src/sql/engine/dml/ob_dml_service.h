@@ -257,6 +257,17 @@ public:
   // static int handle_after_processing_batch(const ObTableModifyOp *op,
   //                                           ObDMLModifyRowsList *dml_modify_rows);
   static int handle_after_row_processing(ObTableModifyOp *op, ObDMLModifyRowsList *dml_modify_rows);
+  // Enqueue AI column regeneration tasks for the row that `dml_ctdef` just
+  // wrote. Called from handle_after_row_processing while the transaction is
+  // still open, so the task rows share the user DML's transaction.
+  static int handle_ai_column_tasks(ObTableModifyOp &op,
+                                    const ObDMLBaseCtDef &dml_ctdef,
+                                    const ObDMLBaseRtDef &dml_rtdef,
+                                    const ObDmlEventType dml_event);
+  // AI columns invalidated by this UPDATE, taken from the implicit
+  // "ai_col = NULL" assignments the resolver injected.
+  static int collect_ai_invalidate_ids(const ObDMLBaseCtDef &dml_ctdef,
+                                       common::ObIArray<uint64_t> &ai_invalidate_ids);
   static int init_ob_rowkey( ObIAllocator &allocator, const int64_t rowkey_cnt, ObRowkey &table_rowkey);
   static int add_trans_info_datum(ObExpr *trans_info_expr,
                                   ObEvalCtx &eval_ctx,

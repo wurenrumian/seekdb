@@ -328,6 +328,7 @@ SQL_UNITY_GROUPS = [
             "src/sql/engine/dml/ob_table_update_op.cpp",
             "src/sql/engine/dml/ob_trigger_handler.cpp",
             "src/sql/engine/dml/ob_fk_checker.cpp",
+            "src/sql/engine/dml/ob_ai_column_task_writer.cpp",
         ],
         generated_srcs = [],
         external_srcs = [],

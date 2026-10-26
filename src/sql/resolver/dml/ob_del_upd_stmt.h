@@ -34,6 +34,11 @@ struct ObAssignment
   bool is_implicit_; // not in update set clause, but add for inner implement,
   bool is_predicate_column_; //mark whether update the predicate column
                      // see ObDMLResolver::resolve_additional_assignments().
+  // Mark an implicit "ai_col = NULL" assignment injected because a column
+  // referenced by the AI column's prompt expression was updated. The executor
+  // uses it to enqueue exactly the AI columns whose result went stale, so that
+  // an update touching only unrelated columns produces no task rows.
+  bool is_ai_invalidate_;
   ObAssignment()
   {
     column_expr_ = NULL;
@@ -41,6 +46,7 @@ struct ObAssignment
     is_duplicated_ = false;
     is_implicit_ = false;
     is_predicate_column_ = false;
+    is_ai_invalidate_ = false;
   }
 
   int deep_copy(ObIRawExprCopier &expr_factory,

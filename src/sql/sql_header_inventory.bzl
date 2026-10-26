@@ -204,6 +204,7 @@ SQL_INTERFACE_CLOSURE_HEADERS = [
     "engine/cmd/ob_load_data_parser.h",
     "engine/dml/ob_dml_ctx_define.h",
     "engine/dml/ob_fk_checker.h",
+    "engine/dml/ob_ai_column_task_writer.h",
     "engine/dml/ob_table_modify_op.h",
     "engine/expr/ob_datum_cast.h",
     "engine/expr/ob_expr.h",

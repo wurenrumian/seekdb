@@ -523,6 +523,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
         ColumnItem *col_item = NULL;
         ObColumnSchemaV2 *column_schema = *iter;
         bool need_assigned = false;
+        bool ai_invalidate = false;
         uint64_t column_id = OB_INVALID_ID;
         if (NULL == column_schema) {
           ret = OB_ERR_UNEXPECTED;
@@ -533,7 +534,8 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
                                                  table_item->table_id_,
                                                  trigger_exist,
                                                  *column_schema,
-                                                 need_assigned))) {
+                                                 need_assigned,
+                                                 ai_invalidate))) {
         } else if (FALSE_IT(need_assigned = need_assigned || 
                                             ((column_schema->is_vec_hnsw_vid_column() ||
                                               column_schema->is_vec_ivf_center_id_column()) && 
@@ -553,6 +555,7 @@ int ObDelUpdResolver::resolve_additional_assignments(ObIArray<ObTableAssignment>
           } else {
             assignment.column_expr_ = col_item->expr_;
             assignment.is_implicit_ = true;
+            assignment.is_ai_invalidate_ = ai_invalidate;
             if (column_schema->is_on_update_current_timestamp()) {
               assignment.column_expr_->set_result_flag(ON_UPDATE_NOW_FLAG);
               ObDefaultValueUtils utils(stmt, &params_, this);
@@ -708,9 +711,11 @@ int ObDelUpdResolver::check_need_assignment(const common::ObIArray<ObAssignment>
                                             uint64_t table_id,
                                             bool before_update_row_trigger_exist,
                                             const ObColumnSchemaV2 &column,
-                                            bool &need_assign)
+                                            bool &need_assign,
+                                            bool &ai_invalidate)
 {
   need_assign = false;
+  ai_invalidate = false;
   int ret = OB_SUCCESS;
   bool exist = false;
   ObDMLStmt *stmt = get_stmt();
@@ -799,6 +804,9 @@ int ObDelUpdResolver::check_need_assignment(const common::ObIArray<ObAssignment>
                                                              ref_column->get_column_id(), exist))) {
           } else if (exist) {
             need_assign = true;
+            // remember that this NULL comes from AI-column invalidation (not
+            // from the user), so the executor can enqueue a regeneration task
+            ai_invalidate = true;
           }
         }
         pos = end + 1;

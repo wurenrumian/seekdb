@@ -25,6 +25,8 @@
 #include "sql/das/ob_das_lock_op.h"
 #include "sql/das/ob_das_utils.h"
 #include "sql/engine/dml/ob_trigger_handler.h"
+#include "sql/engine/dml/ob_ai_column_task_writer.h"
+#include "share/schema/ob_multi_version_schema_service.h"
 #include "share/autoincrement/ob_i_tablet_autoincrement_service.h"
 #include "data_plane/lob/ob_lob_read.h"
 #include "data_plane/transaction/ob_i_transaction_service.h"
@@ -2123,6 +2125,122 @@ int ObDMLService::get_nested_delete_ctx(const uint64_t table_id,
   return ret;
 }
 
+int ObDMLService::handle_ai_column_tasks(ObTableModifyOp &op,
+                                         const ObDMLBaseCtDef &dml_ctdef,
+                                         const ObDMLBaseRtDef &dml_rtdef,
+                                         const ObDmlEventType dml_event)
+{
+  int ret = OB_SUCCESS;
+  if (!dml_ctdef.has_ai_column_) {
+    // fast path: the table declares no AI column
+  } else if (!dml_ctdef.is_primary_index_) {
+    // index maintenance ctdefs share the table but must not queue tasks twice
+  } else if (dml_event != ObDmlEventType::DE_INSERTING
+             && dml_event != ObDmlEventType::DE_UPDATING
+             && dml_event != ObDmlEventType::DE_DELETING) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column task: unexpected dml event", K(ret), K(dml_event));
+  } else {
+    ObExecContext &exec_ctx = op.get_exec_ctx();
+    ObSchemaGetterGuard schema_guard;
+    // index_tid_ is the table this ctdef writes (the data table for the primary
+    // index ctdef); table_id_ is the table location id.
+    const uint64_t table_id = dml_ctdef.das_base_ctdef_.index_tid_;
+    ObSEArray<uint64_t, 4> ai_invalidate_ids;
+    ObSEArray<uint64_t, 4> ai_column_ids;
+    ObSEArray<uint64_t, 4> rowkey_ids;
+    ObSEArray<ObString, 4> rowkey_names;
+    ObArenaAllocator allocator("AiColumnTask");
+    ObString rowkey_predicate;
+    if (OB_FAIL(ObMultiVersionSchemaService::get_instance()
+                    .get_runtime_schema_guard(schema_guard))) {
+      LOG_WARN("ai column task: get schema guard failed", K(ret));
+    } else if (OB_UNLIKELY(!dml_ctdef.is_primary_index_)) {
+      // handled above
+    } else if (ObDmlEventType::DE_UPDATING == dml_event
+               && OB_FAIL(collect_ai_invalidate_ids(dml_ctdef, ai_invalidate_ids))) {
+      LOG_WARN("ai column task: collect invalidation targets failed", K(ret));
+    } else if (ObDmlEventType::DE_DELETING == dml_event) {
+      // collected below: a delete purges every AI column of the removed row
+    } else if (OB_FAIL(ObAiColumnTaskWriter::collect_ai_columns(
+                   schema_guard, table_id,
+                   ObDmlEventType::DE_INSERTING == dml_event,
+                   ai_invalidate_ids, ai_column_ids))) {
+      LOG_WARN("ai column task: collect ai columns failed", K(ret), K(table_id));
+    }
+    if (OB_FAIL(ret)) {
+    } else if (ObDmlEventType::DE_DELETING == dml_event) {
+      // A deleted row must not leave a pending task behind, otherwise the
+      // worker regenerates a value for a row that no longer exists.
+      if (OB_FAIL(ObAiColumnTaskWriter::collect_ai_columns(
+              schema_guard, table_id, true /* all AI columns */,
+              ai_invalidate_ids, ai_column_ids))) {
+        LOG_WARN("ai column task: collect ai columns failed", K(ret), K(table_id));
+      } else if (ai_column_ids.empty()) {
+        // table has no AI column after all
+      } else if (OB_FAIL(ObAiColumnTaskWriter::get_rowkey_columns(
+                     schema_guard, table_id, rowkey_ids, rowkey_names))) {
+      } else if (OB_FAIL(ObAiColumnTaskWriter::build_rowkey_predicate(
+                     op.get_eval_ctx(),
+                     dml_ctdef.old_row_,
+                     dml_ctdef.column_ids_,
+                     rowkey_ids,
+                     rowkey_names,
+                     op.get_obj_print_params(),
+                     allocator,
+                     rowkey_predicate))) {
+        LOG_WARN("ai column task: build rowkey predicate failed", K(ret), K(table_id));
+      } else if (OB_FAIL(ObAiColumnTaskWriter::purge_tasks(
+                     exec_ctx, table_id, ai_column_ids, rowkey_predicate))) {
+        LOG_WARN("ai column task: purge tasks failed", K(ret), K(table_id));
+      }
+    } else if (ai_column_ids.empty()) {
+      // nothing to enqueue
+    } else if (OB_FAIL(ObAiColumnTaskWriter::get_rowkey_columns(
+                   schema_guard, table_id, rowkey_ids, rowkey_names))) {
+    } else if (OB_FAIL(ObAiColumnTaskWriter::build_rowkey_predicate(
+                   op.get_eval_ctx(),
+                   dml_ctdef.new_row_,
+                   dml_ctdef.column_ids_,
+                   rowkey_ids,
+                   rowkey_names,
+                   op.get_obj_print_params(),
+                   allocator,
+                   rowkey_predicate))) {
+      LOG_WARN("ai column task: build rowkey predicate failed", K(ret), K(table_id));
+    } else if (OB_FAIL(ObAiColumnTaskWriter::enqueue_tasks(
+                   exec_ctx, table_id, ai_column_ids, rowkey_predicate))) {
+      LOG_WARN("ai column task: enqueue tasks failed", K(ret), K(table_id));
+    } else {
+      LOG_DEBUG("ai column task: enqueued", K(table_id), K(ai_column_ids),
+                K(rowkey_predicate));
+    }
+  }
+  return ret;
+}
+
+int ObDMLService::collect_ai_invalidate_ids(const ObDMLBaseCtDef &dml_ctdef,
+                                            ObIArray<uint64_t> &ai_invalidate_ids)
+{
+  int ret = OB_SUCCESS;
+  const ObUpdCtDef &upd_ctdef = static_cast<const ObUpdCtDef &>(dml_ctdef);
+  ai_invalidate_ids.reset();
+  for (int64_t i = 0; OB_SUCC(ret) && i < upd_ctdef.assign_columns_.count(); ++i) {
+    const ColumnContent &info = upd_ctdef.assign_columns_.at(i);
+    const int64_t row_idx = static_cast<int64_t>(info.projector_index_);
+    if (!info.is_ai_invalidate_) {
+      // user-written assignment or unrelated implicit assignment
+    } else if (row_idx < 0 || row_idx >= dml_ctdef.column_ids_.count()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ai column task: assignment projector out of range", K(ret),
+               K(row_idx), K(dml_ctdef.column_ids_.count()));
+    } else if (OB_FAIL(ai_invalidate_ids.push_back(dml_ctdef.column_ids_.at(row_idx)))) {
+      LOG_WARN("ai column task: push invalidate id failed", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_modify_rows, ObTableModifyOp *dml_op)
 {
   int ret = OB_SUCCESS;
@@ -2179,6 +2297,10 @@ int ObDMLService::handle_after_processing_multi_row(ObDMLModifyRowsList *dml_mod
           } else if (OB_FAIL(TriggerHandle::do_handle_after_row(op, dml_ctdef.trig_ctdef_, dml_rtdef.trig_rtdef_, dml_event))) {
           }
         }
+        // enqueue AI column regeneration tasks (same transaction, after the
+        // row is written and FK/trigger handling is done)
+        if (OB_SUCC(ret) && OB_FAIL(handle_ai_column_tasks(op, dml_ctdef, dml_rtdef, dml_event))) {
+        }
       }
     }
 
@@ -2218,6 +2340,8 @@ int ObDMLService::handle_after_processing_single_row(ObDMLModifyRowNode &modify_
       }
     }
     if (OB_SUCC(ret) && OB_FAIL(TriggerHandle::do_handle_after_row(op, dml_ctdef.trig_ctdef_, dml_rtdef.trig_rtdef_, dml_event))) {
+    }
+    if (OB_SUCC(ret) && OB_FAIL(handle_ai_column_tasks(op, dml_ctdef, dml_rtdef, dml_event))) {
     }
   }
   return ret;

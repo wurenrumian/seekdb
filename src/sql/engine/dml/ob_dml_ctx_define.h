@@ -354,6 +354,7 @@ struct ColumnContent
     auto_filled_timestamp_(false),
     is_nullable_(false),
     is_implicit_(false),
+    is_ai_invalidate_(false),
     is_predicate_column_(false),
     srs_id_(UINT64_MAX),
     column_name_()
@@ -363,6 +364,7 @@ struct ColumnContent
                N_AUTO_FILL_TIMESTAMP, auto_filled_timestamp_,
                N_NULLABLE, is_nullable_,
                "implicit", is_implicit_,
+               "ai_invalidate", is_ai_invalidate_,
                K_(is_predicate_column),
                K_(srs_id),
                N_COLUMN_NAME, column_name_);
@@ -371,6 +373,10 @@ struct ColumnContent
   bool auto_filled_timestamp_;
   bool is_nullable_;
   bool is_implicit_;
+  // This implicit assignment is an AI column invalidation: the column's prompt
+  // dependency changed, so its stored result was reset to NULL and a
+  // regeneration task must be enqueued for the row.
+  bool is_ai_invalidate_;
   bool is_predicate_column_;
   union { // only for gis
     struct {
@@ -438,6 +444,9 @@ public:
   bool reserved_advanced_trigger_;
   ObExpr *trans_info_expr_;
   bool is_vec_hnsw_index_vid_opt_;
+  // The target table has at least one AI column, so a DML on it may need to
+  // enqueue AI column regeneration tasks. Set on the primary index ctdef only.
+  bool has_ai_column_;
 protected:
   ObDMLBaseCtDef(common::ObIAllocator &alloc,
                  ObDASDMLBaseCtDef &das_base_ctdef,
@@ -456,7 +465,8 @@ protected:
       is_table_without_pk_(false),
       reserved_advanced_trigger_(false),
       trans_info_expr_(nullptr),
-      is_vec_hnsw_index_vid_opt_(false)
+      is_vec_hnsw_index_vid_opt_(false),
+      has_ai_column_(false)
   { }
 };
 
