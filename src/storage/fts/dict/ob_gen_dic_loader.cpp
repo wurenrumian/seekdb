@@ -125,20 +125,36 @@ int ObGenDicLoader::get_dic_loader(const ObString &parser_name,
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(dic_loader_key.init(parser_name, charset))) {
   } else {
-    TCWLockGuard guard(lock_);
-    if (OB_FAIL(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
-      if (OB_HASH_NOT_EXIST == ret) {
-        if (OB_FAIL(gen_dic_loader(dic_loader_key, dic_loader))) {
-        } else if (OB_ISNULL(dic_loader)) {
-          ret = OB_ERR_UNEXPECTED;
-        } else if (OB_FAIL(dic_loader_map_.set_refactored(dic_loader_key, dic_loader))) {
-        } else if (OB_FALSE_IT(dic_loader->inc_ref())) {
-        } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
-        }
-      } else {
-        ret = OB_ERR_UNEXPECTED;
+    // Lookup runs on every TOKENIZE evaluation, while a loader, once created, is
+    // kept in the map for the whole process lifetime. So the "already exists"
+    // case only needs a shared lock; the exclusive lock is reserved for the
+    // one-time creation below.
+    {
+      TCRLockGuard guard(lock_);
+      if (OB_SUCC(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
+        ret = loader_handle.set_loader(dic_loader);
+      } else if (OB_HASH_NOT_EXIST == ret) {
+        ret = OB_SUCCESS;
       }
-    } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+    }
+    if (OB_SUCC(ret) && !loader_handle.is_valid()) {
+      TCWLockGuard guard(lock_);
+      // Re-check under the exclusive lock: another session may have created the
+      // loader between the shared lookup and this point.
+      if (OB_FAIL(dic_loader_map_.get_refactored(dic_loader_key, dic_loader))) {
+        if (OB_HASH_NOT_EXIST == ret) {
+          if (OB_FAIL(gen_dic_loader(dic_loader_key, dic_loader))) {
+          } else if (OB_ISNULL(dic_loader)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(dic_loader_map_.set_refactored(dic_loader_key, dic_loader))) {
+          } else if (OB_FALSE_IT(dic_loader->inc_ref())) {
+          } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+          }
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+        }
+      } else if (OB_FAIL(loader_handle.set_loader(dic_loader))) {
+      }
     }
   }
   return ret;

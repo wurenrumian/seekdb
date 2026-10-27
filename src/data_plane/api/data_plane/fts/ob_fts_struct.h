@@ -51,7 +51,16 @@ private:
   ObObjMeta meta_;
 };
 
-typedef common::hash::ObHashMap<ObFTWord, int64_t> ObFTWordMap;
+// ObFTWordMap is a per-document scratch map. Every construction site is a
+// function-local variable used by a single thread:
+//   - ObDASDomainUtils::generate_fulltext_word_rows (per doc, DML thread)
+//   - ObExprTokenize::tokenize_fulltext            (per TOKENIZE eval)
+//   - ObDAS(TextRetrieval|LegacyTR)MergeIter       (per query analysis)
+// so the default LatchReadWriteDefendMode only buys per-bucket lock/unlock on
+// every insert and lookup. NoPthreadDefendMode drops that; it is the same trade
+// the engine already makes for runner-local maps (see ob_expr_in.h,
+// ob_pushdown_filter.h).
+typedef common::hash::ObHashMap<ObFTWord, int64_t, common::hash::NoPthreadDefendMode> ObFTWordMap;
 
 class ObAddWordFlag final
 {

@@ -1027,6 +1027,11 @@ int ObFTParserProperty::parse_for_parser_helper(const ObFTParser &parser, const 
       quantifier_table_ = ObString(ObFTSLiteral::CONFIG_NAME_QUANTIFIER_TABLE);
       ObString ik_smart;
       if (OB_FAIL(props.config_get_ik_mode(ik_smart))) {
+        if (OB_SEARCH_NOT_FOUND == ret) {
+          // No "ik_mode" key: fall back to the documented default (smart), which
+          // is also what the DDL path normalizes missing keys to.
+          ret = OB_SUCCESS;
+        }
       } else {
         if (0 == ik_smart.case_compare(ObString(ObFTSLiteral::FT_IK_MODE_SMART))) {
           ik_mode_smart_ = true;

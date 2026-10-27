@@ -377,7 +377,15 @@ int ObExprTokenize::TokenizeParam::reform_parser_properties(const ObString &prop
   int ret = OB_SUCCESS;
   storage::ObFTParserJsonProps parser_properties;
 
-  if (OB_FAIL(parser_properties.init())) {
+  if (properties.empty()) {
+    // No properties were given. ObFTParserProperty is default-constructed with
+    // exactly the values the rebuild below would fill in (min/max token size,
+    // ngram sizes, ik_mode=smart), and parse_for_parser_helper already treats a
+    // missing key as "use the default". Round-tripping the empty document
+    // through parse -> rebuild -> print only burns JSON parsing and printing on
+    // every TOKENIZE evaluation, so skip it and leave properties_ empty.
+    properties_ = ObString();
+  } else if (OB_FAIL(parser_properties.init())) {
   } else if (OB_FAIL(parser_properties.parse_from_valid_str(properties))) {
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "parser properties invalid.");
   } else if (OB_FAIL(parser_properties.rebuild_props_for_ddl(parser_name_,
