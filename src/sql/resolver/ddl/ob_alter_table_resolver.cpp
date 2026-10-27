@@ -588,6 +588,18 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
             }
             break;
         }
+        case T_AI_COLUMN_RETRY: {
+            // `retry ai column <col> [where <pred>]` is a standalone action: it
+            // re-queues regeneration for one AI column and must not be mixed
+            // with another ALTER action.
+            if (1 != node.num_child_) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                             "combining AI COLUMN RETRY with another ALTER action not supported");
+            } else if (OB_FAIL(resolve_retry_ai_column(*action_node))) {
+            }
+            break;
+        }
         default: {
             ret = OB_ERR_UNEXPECTED;
             SQL_RESV_LOG(WARN, "Unknown alter table action %d", K_(action_node->type), K(ret));
@@ -860,6 +872,67 @@ int ObAlterTableResolver::resolve_drop_column_nodes_for_mysql(
       } else if (column_node->type_ == T_COLUMN_DROP &&
                 OB_FAIL(resolve_drop_column(*column_node, reduced_visible_col_set, drop_column_names_set))) {
         SQL_RESV_LOG(WARN, "Resolve drop column error!", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAlterTableResolver::resolve_retry_ai_column(const ParseNode &node)
+{
+  int ret = OB_SUCCESS;
+  ObAlterTableStmt *alter_table_stmt = get_alter_table_stmt();
+  if (OB_ISNULL(alter_table_stmt) || OB_ISNULL(table_schema_) || OB_ISNULL(schema_checker_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_UNLIKELY(2 != node.num_child_) || OB_ISNULL(node.children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid ai column retry parse tree", K(ret));
+  } else {
+    const ParseNode *column_node = node.children_[0];
+    ObString column_name(static_cast<int32_t>(column_node->str_len_), column_node->str_value_);
+    const ObColumnSchemaV2 *column_schema = nullptr;
+    if (OB_UNLIKELY(column_name.empty())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(column_schema = table_schema_->get_column_schema(column_name))) {
+      ret = OB_ERR_BAD_FIELD_ERROR;
+      LOG_USER_ERROR(OB_ERR_BAD_FIELD_ERROR, column_name.length(), column_name.ptr(),
+                     table_schema_->get_table_name_str().length(),
+                     table_schema_->get_table_name_str().ptr());
+    } else if (!column_schema->is_ai_column()) {
+      // Only an AI column holds a derived value that can be regenerated.
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                     "retrying a column that is not an AI column not supported");
+    } else {
+      alter_table_stmt->set_alter_table_ai_column_retry(column_schema->get_column_id());
+      // The retry path does not go through a column action, so the executor
+      // cannot rely on it having been filled; carry the table id explicitly.
+      alter_table_stmt->get_alter_table_arg().table_id_ = table_schema_->get_table_id();
+      // children_[1] is the optional T_WHERE_CLAUSE; children_[0] of it carries
+      // the predicate text captured by the parser.
+      const ParseNode *where_node = node.children_[1];
+      if (NULL != where_node && 2 == where_node->num_child_ && NULL != where_node->children_[0]) {
+        const ParseNode *pred_node = where_node->children_[0];
+        if (NULL != pred_node->str_value_ && pred_node->str_len_ > 0) {
+          // The captured text starts at the WHERE token, so drop the keyword
+          // before appending the predicate to the internal update.
+          ObString pred(static_cast<int32_t>(pred_node->str_len_), pred_node->str_value_);
+          pred = pred.trim();
+          if (pred.length() >= 5 && 0 == strncasecmp(pred.ptr(), "where", 5)) {
+            pred.assign_ptr(pred.ptr() + 5, pred.length() - 5);
+            pred = pred.trim();
+          }
+          ObString copied;
+          if (pred.empty()) {
+            // `where` with no predicate cannot happen: the grammar requires an
+            // expression, so treat it as absent rather than retrying everything.
+          } else if (OB_FAIL(ob_write_string(alter_table_stmt->get_alter_table_arg().allocator_,
+                                             pred, copied))) {
+            SQL_RESV_LOG(WARN, "copy ai column retry predicate failed", K(ret));
+          } else {
+            alter_table_stmt->get_alter_table_arg().ai_column_retry_predicate_ = copied;
+          }
+        }
       }
     }
   }

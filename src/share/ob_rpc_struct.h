@@ -1195,7 +1195,9 @@ public:
       lock_session_id_(0),
       lock_session_create_ts_(0),
       lock_priority_(transaction::tablelock::ObTableLockPriority::NORMAL),
-      data_version_(0)
+      data_version_(0),
+      ai_column_retry_column_id_(common::OB_INVALID_ID),
+      ai_column_retry_predicate_(NULL)
   {
   }
   virtual ~ObAlterTableArg()
@@ -1302,6 +1304,11 @@ public:
   int64_t lock_session_create_ts_;
   transaction::tablelock::ObTableLockPriority lock_priority_;
   uint64_t data_version_;
+  // `alter table ... retry ai column <c> [where ...]`: the column to regenerate
+  // and the optional predicate as SQL text. Both are only used on the local
+  // executor path, so they are not serialized.
+  uint64_t ai_column_retry_column_id_;
+  common::ObString ai_column_retry_predicate_;
   int serialize_index_args(char *buf, const int64_t data_len, int64_t &pos) const;
   int deserialize_index_args(const char *buf, const int64_t data_len, int64_t &pos);
   int64_t get_index_args_serialize_size() const;

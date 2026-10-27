@@ -333,7 +333,7 @@ END_P SET_VAR DELIMITER
         QUANTIFIER_TABLE QUARTER QUERY QUEUE_TIME QUICK
 
         RECOVER REDUNDANT REFRESH RELAY RELAYLOG RELAY_LOG_FILE RELAY_LOG_POS RELAY_THREAD RELOAD REMOVE
-        REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETURNED_SQLSTATE RETURNS RETURNING REVERSE
+        REPEATABLE RESET RESPECT RESTART RESTORE RESUME RETRY RETURNED_SQLSTATE RETURNS RETURNING REVERSE
         REWRITE ROLLBACK ROLLUP ROUTINE ROW ROWID ROW_COUNT ROW_FORMAT ROWS RTREE
         RUN RECYCLEBIN REPLICATION ROTATE ROW_NUMBER RUDUNDANT RECURSIVE RANDOM REDO_TRANSPORT_OPTIONS
         RANK READ_ONLY RECOVERY REJECT ROLE
@@ -14777,6 +14777,19 @@ DROP CONSTRAINT constraint_name
   (void)($3);
   $$ = NULL;
 }
+| RETRY AI COLUMN column_name opt_where
+{
+  // Regenerate one AI column: the rows selected by the optional predicate are
+  // invalidated and queued again. Keeping it a standalone action lets the
+  // resolver reject it when combined with another ALTER action.
+  ParseNode *where_node = $5;
+  if (NULL != where_node && 2 == where_node->num_child_ && NULL != where_node->children_[0]) {
+    // Keep the predicate as written: the executor re-runs it as part of the
+    // internal update, so it must not be re-rendered from the parse tree.
+    dup_expr_string(where_node->children_[0], result, @5.first_column, @5.last_column);
+  }
+  malloc_non_terminal_node($$, result->malloc_pool_, T_AI_COLUMN_RETRY, 2, $4, where_node);
+}
 ;
 
 algorithm_opt:
@@ -17995,6 +18008,7 @@ ACCOUNT
 |       RESTART
 |       RESTORE
 |       RESUME
+|       RETRY
 |       RETURNED_SQLSTATE
 |       RETURNING
 |       RETURNS

@@ -19,6 +19,9 @@
 #include "common/ob_timeout_ctx.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
 #include "share/ob_server_struct.h"
+#include "common/mysqlclient/ob_mysql_proxy.h"
+#include "share/schema/ob_multi_version_schema_service.h"
+#include "share/schema/ob_schema_getter_guard.h"
 #include "sql/engine/cmd/ob_table_executor.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/command/ob_root_service_serialization.h"
@@ -751,6 +754,64 @@ int ObAlterTableExecutor::alter_table_exchange_partition_rpc(obcall::ObExchangeP
   return ret;
 }
 
+int ObAlterTableExecutor::execute_retry_ai_column(ObExecContext &ctx,
+                                                 ObAlterTableStmt &stmt,
+                                                 obcall::ObAlterTableArg &alter_table_arg)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *my_session = ctx.get_my_session();
+  ObPhysicalPlanCtx *plan_ctx = ctx.get_physical_plan_ctx();
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  const ObTableSchema *table_schema = nullptr;
+  const ObColumnSchemaV2 *ai_column = nullptr;
+  const ObDatabaseSchema *database_schema = nullptr;
+  ObSchemaGetterGuard schema_guard;
+  if (OB_ISNULL(my_session) || OB_ISNULL(plan_ctx)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance()
+                         .get_runtime_schema_guard(schema_guard))) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(alter_table_arg.table_id_, table_schema))) {
+    LOG_WARN("get table schema failed", K(ret), K(alter_table_arg.table_id_));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+  } else if (OB_ISNULL(ai_column = table_schema->get_column_schema(
+                 alter_table_arg.ai_column_retry_column_id_))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(schema_guard.get_database_schema(table_schema->get_database_id(),
+                                                      database_schema))) {
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    // Reset the AI column so the row is visibly stale and the queued task
+    // regenerates it. The predicate is the one the user wrote; without it the
+    // whole table is retried.
+    const ObString &pred = alter_table_arg.ai_column_retry_predicate_;
+    const ObString &db_name = database_schema->get_database_name_str();
+    const ObString &table_name = table_schema->get_table_name_str();
+    if (OB_FAIL(sql.append_fmt("update `%.*s`.`%.*s` set `%.*s` = null",
+                               db_name.length(), db_name.ptr(),
+                               table_name.length(), table_name.ptr(),
+                               ai_column->get_column_name_str().length(),
+                               ai_column->get_column_name_str().ptr()))) {
+      LOG_WARN("build retry ai column sql failed", K(ret));
+    } else if (!pred.empty() && OB_FAIL(sql.append_fmt(" where %.*s", pred.length(), pred.ptr()))) {
+      LOG_WARN("append retry ai column predicate failed", K(ret), K(pred));
+    } else {
+      // Use the same SQL proxy the AI column worker uses; the session inner
+      // connection is not available on this path.
+      ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+      if (OB_ISNULL(sql_proxy)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
+        LOG_WARN("execute retry ai column failed", K(ret), K(sql));
+      } else if (FALSE_IT(plan_ctx->set_affected_rows(affected_rows))) {
+      }
+    }
+  }
+  return ret;
+}
+
 int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
 {
   int ret = OB_SUCCESS;
@@ -768,6 +829,12 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
       OZ (query::serialize_root_service_call(
           [&]{ return ctx.root_command_service().alter_trigger(stmt.get_tg_arg()); }),
           GCTX.self_addr());
+    }
+  } else if (common::OB_INVALID_ID != alter_table_arg.ai_column_retry_column_id_) {
+    // `alter table ... retry ai column <c> [where <pred>]` is a data operation,
+    // not a schema change: invalidate the selected rows and let the background
+    // worker regenerate them, exactly like an implicit invalidation would.
+    if (OB_FAIL(execute_retry_ai_column(ctx, stmt, alter_table_arg))) {
     }
   } else {
     ObSQLSessionInfo *my_session = NULL;

@@ -62,6 +62,12 @@ public:
   inline void set_alter_table_column(){alter_table_arg_.is_alter_columns_ = true;}
   inline void set_alter_table_index(){alter_table_arg_.is_alter_indexs_ = true;}
   inline void set_alter_table_partition(){alter_table_arg_.is_alter_partitions_ = true;}
+  // `alter table ... retry ai column <c>`: carried on the arg so the executor can
+  // regenerate the selected rows without going through schema change.
+  inline void set_alter_table_ai_column_retry(const uint64_t column_id)
+  {
+    alter_table_arg_.ai_column_retry_column_id_ = column_id;
+  }
 
   const common::ObString &get_org_database_name() const
   { return alter_table_arg_.alter_table_schema_.get_origin_database_name(); }
