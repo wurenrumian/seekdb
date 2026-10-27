@@ -73,6 +73,31 @@ public:
                            const common::ObIArray<uint64_t> &ai_column_ids,
                            const common::ObString &rowkey_predicate);
 
+  // Enqueue a pending task for one AI column of every row matched by a SQL
+  // predicate, e.g. the `where` clause of `alter table ... retry ai column`.
+  //
+  // Row images are not available on the ALTER path, so the target rows are read
+  // back from the data table. Callers must collect the rows BEFORE resetting the
+  // AI column: a predicate may reference the column being reset (for example the
+  // `status = 'READY'` pseudo column, which means "result is not null"), and it
+  // would match nothing afterwards.
+  //
+  // @param predicate  row filter without the WHERE keyword; empty means all rows
+  // @param out        one "`pk` = value" predicate per matched row
+  static int collect_row_predicates(share::schema::ObSchemaGetterGuard &schema_guard,
+                                    uint64_t table_id,
+                                    const common::ObString &predicate,
+                                    common::ObIAllocator &allocator,
+                                    common::ObIArray<common::ObString> &out);
+
+  // Queue one task per collected row. Written through the SQL proxy rather than
+  // the session transaction: the ALTER path commits the reset of the AI column
+  // immediately and has no transaction descriptor to attach to.
+  static int enqueue_task_rows(ObExecContext &exec_ctx,
+                               uint64_t table_id,
+                               uint64_t ai_column_id,
+                               const common::ObIArray<common::ObString> &row_predicates);
+
   // Collect the AI columns to regenerate for one modified row.
   //
   // @param schema_guard          runtime schema guard

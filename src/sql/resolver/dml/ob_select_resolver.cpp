@@ -1052,6 +1052,12 @@ int ObSelectResolver::resolve(const ParseNode &parse_tree)
     }
   }
 
+  // Strict reads are a statement level gate: once the statement is fully
+  // resolved, every AI column it touches must be complete.
+  if (OB_SUCC(ret) && OB_FAIL(check_ai_column_strict_read(select_stmt))) {
+    LOG_WARN("ai column strict read failed", K(ret));
+  }
+
   return ret;
 }
 

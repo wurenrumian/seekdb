@@ -23,6 +23,7 @@
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "sql/engine/cmd/ob_table_executor.h"
+#include "sql/engine/dml/ob_ai_column_task_writer.h"
 #include "query/command/ob_root_command_service.h"
 #include "query/command/ob_root_service_serialization.h"
 #include "query/runtime/ob_query_runtime_environment.h"
@@ -767,6 +768,8 @@ int ObAlterTableExecutor::execute_retry_ai_column(ObExecContext &ctx,
   const ObColumnSchemaV2 *ai_column = nullptr;
   const ObDatabaseSchema *database_schema = nullptr;
   ObSchemaGetterGuard schema_guard;
+  ObArenaAllocator allocator("AiColumnRetry");
+  ObSEArray<ObString, 16> row_predicates;
   if (OB_ISNULL(my_session) || OB_ISNULL(plan_ctx)) {
     ret = OB_NOT_INIT;
   } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance()
@@ -783,31 +786,58 @@ int ObAlterTableExecutor::execute_retry_ai_column(ObExecContext &ctx,
   } else if (OB_ISNULL(database_schema)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    // Reset the AI column so the row is visibly stale and the queued task
-    // regenerates it. The predicate is the one the user wrote; without it the
-    // whole table is retried.
     const ObString &pred = alter_table_arg.ai_column_retry_predicate_;
-    const ObString &db_name = database_schema->get_database_name_str();
-    const ObString &table_name = table_schema->get_table_name_str();
-    if (OB_FAIL(sql.append_fmt("update `%.*s`.`%.*s` set `%.*s` = null",
-                               db_name.length(), db_name.ptr(),
-                               table_name.length(), table_name.ptr(),
-                               ai_column->get_column_name_str().length(),
-                               ai_column->get_column_name_str().ptr()))) {
-      LOG_WARN("build retry ai column sql failed", K(ret));
-    } else if (!pred.empty() && OB_FAIL(sql.append_fmt(" where %.*s", pred.length(), pred.ptr()))) {
-      LOG_WARN("append retry ai column predicate failed", K(ret), K(pred));
-    } else {
-      // Use the same SQL proxy the AI column worker uses; the session inner
-      // connection is not available on this path.
-      ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
-      if (OB_ISNULL(sql_proxy)) {
-        ret = OB_ERR_UNEXPECTED;
-      } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
-        LOG_WARN("execute retry ai column failed", K(ret), K(sql));
-      } else if (FALSE_IT(plan_ctx->set_affected_rows(affected_rows))) {
-      }
+    // Collect the target rows BEFORE resetting the column. The predicate may
+    // reference the AI column itself (via the retry-only STATUS pseudo column,
+    // where 'READY' means "result is not null"), so it stops matching once the
+    // values are gone.
+    if (OB_FAIL(ObAiColumnTaskWriter::collect_row_predicates(
+            schema_guard, alter_table_arg.table_id_, pred, allocator,
+            row_predicates))) {
+      LOG_WARN("collect retry ai column rows failed", K(ret), K(pred));
+    } else if (row_predicates.empty()) {
+      // Zero-row predicate: leave every result untouched and queue nothing.
+      LOG_INFO("retry ai column matched no row", K(pred));
+    } else if (OB_FAIL(reset_ai_column_values(schema_guard, *table_schema, *ai_column,
+                                              *database_schema, pred))) {
+      LOG_WARN("reset retry ai column values failed", K(ret));
+    } else if (OB_FAIL(ObAiColumnTaskWriter::enqueue_task_rows(
+                   ctx, alter_table_arg.table_id_, ai_column->get_column_id(),
+                   row_predicates))) {
+      LOG_WARN("enqueue retry ai column tasks failed", K(ret));
+    } else if (FALSE_IT(plan_ctx->set_affected_rows(row_predicates.count()))) {
     }
+  }
+  return ret;
+}
+
+int ObAlterTableExecutor::reset_ai_column_values(
+    ObSchemaGetterGuard &schema_guard,
+    const ObTableSchema &table_schema,
+    const ObColumnSchemaV2 &ai_column,
+    const ObDatabaseSchema &database_schema,
+    const ObString &predicate)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  const ObString &db_name = database_schema.get_database_name_str();
+  const ObString &table_name = table_schema.get_table_name_str();
+  ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+  UNUSED(schema_guard);
+  if (OB_FAIL(sql.append_fmt("update `%.*s`.`%.*s` set `%.*s` = null",
+                             db_name.length(), db_name.ptr(),
+                             table_name.length(), table_name.ptr(),
+                             ai_column.get_column_name_str().length(),
+                             ai_column.get_column_name_str().ptr()))) {
+    LOG_WARN("build retry ai column sql failed", K(ret));
+  } else if (!predicate.empty()
+             && OB_FAIL(sql.append_fmt(" where %.*s", predicate.length(), predicate.ptr()))) {
+    LOG_WARN("append retry ai column predicate failed", K(ret), K(predicate));
+  } else if (OB_ISNULL(sql_proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
+    LOG_WARN("execute retry ai column failed", K(ret), K(sql));
   }
   return ret;
 }

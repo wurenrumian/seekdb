@@ -148,6 +148,8 @@ int ObUpdateResolver::resolve(const ParseNode &parse_tree)
     } else if (OB_FAIL(update_stmt->check_dml_need_filter_null())) {
     } else if (OB_FAIL(update_stmt->check_dml_source_from_join())) {
     } else if (OB_FAIL(check_safe_update_mode(update_stmt))) {
+    } else if (OB_FAIL(check_ai_column_strict_read(update_stmt))) {
+      LOG_WARN("ai column strict read failed", K(ret));
     } else { /*do nothing*/ }
   }
   return ret;

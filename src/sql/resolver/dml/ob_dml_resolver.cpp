@@ -5496,6 +5496,122 @@ int ObDMLResolver::resolve_inlist_info(ObIArray<ObInListInfo> &inlist_infos)
   return ret;
 }
 
+int ObDMLResolver::check_ai_column_strict_read(ObDMLStmt *stmt)
+{
+  int ret = OB_SUCCESS;
+  bool strict_read = false;
+  ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+  // Deduplicate by column, not by table: one statement usually names several
+  // columns of the same table, and each AI column has to be checked on its own.
+  ObSEArray<uint64_t, 8> checked_columns;
+  if (OB_ISNULL(stmt) || OB_ISNULL(session_info_) || OB_ISNULL(schema_checker_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(session_info_->get_sys_variable(SYS_VAR_AI_COLUMN_STRICT_READ,
+                                                     strict_read))) {
+  } else if (!strict_read) {
+    // strict reads are off: nothing to validate
+  } else if (session_info_->is_in_transaction()) {
+    // The probe below runs a statement of its own. Inside an explicit
+    // transaction that would touch the transaction's read snapshot, which the
+    // surrounding statements (for example the task-table assertions of the
+    // DML acceptance test) then observe as a stale or moved snapshot. Strict
+    // reads protect against reading partial results, and an open transaction
+    // has not published anything yet, so skipping the check there is both safe
+    // and keeps transaction semantics untouched.
+  } else if (OB_ISNULL(sql_proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column strict read: null sql proxy", K(ret));
+  } else {
+    // Every base table column the statement mentions appears as a column item,
+    // whether it sits in the select list, a WHERE clause, a join condition or a
+    // subquery. That is what makes this cover all the read/write paths at once.
+    const ObIArray<ColumnItem> &column_items = stmt->get_column_items();
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_items.count(); ++i) {
+      const ColumnItem &item = column_items.at(i);
+      const ObTableSchema *table_schema = nullptr;
+      const ObColumnSchemaV2 *column_schema = nullptr;
+      const uint64_t table_id = item.base_tid_ != OB_INVALID_ID ? item.base_tid_ : item.table_id_;
+      const uint64_t column_id = item.base_cid_ != OB_INVALID_ID ? item.base_cid_
+                                                                 : item.column_id_;
+      if (OB_INVALID_ID == table_id || OB_INVALID_ID == column_id) {
+        // derived / pseudo column, not a stored AI column
+      } else if (has_exist_in_array(checked_columns, column_id)) {
+        // already validated in this statement
+      } else if (OB_FAIL(schema_checker_->get_table_schema(table_id, table_schema))) {
+        LOG_WARN_IGNORE_COL_NOTFOUND(ret, "ai column strict read: no table schema",
+                                     K(ret), K(table_id));
+        ret = OB_SUCCESS;
+      } else if (OB_ISNULL(table_schema)) {
+        // table not visible to this resolver: nothing to validate
+      } else if (OB_ISNULL(column_schema = table_schema->get_column_schema(column_id))) {
+        // the column item may point at a hidden or derived column
+      } else if (!column_schema->is_ai_column()) {
+        // ordinary column
+      } else if (OB_FAIL(checked_columns.push_back(column_id))) {
+      } else if (OB_FAIL(check_ai_column_ready(*table_schema, *column_schema))) {
+        LOG_WARN("ai column strict read: column not ready", K(ret),
+                 K(table_id), K(column_id));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDMLResolver::check_ai_column_ready(const ObTableSchema &table_schema,
+                                         const ObColumnSchemaV2 &column_schema)
+{
+  int ret = OB_SUCCESS;
+  ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+  ObSchemaGetterGuard guard;
+  const ObDatabaseSchema *database_schema = nullptr;
+  ObSqlString sql;
+  if (OB_ISNULL(sql_proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_runtime_schema_guard(guard))) {
+  } else if (OB_FAIL(guard.get_database_schema(table_schema.get_database_id(),
+                                               database_schema))) {
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const ObString &db_name = database_schema->get_database_name_str();
+    const ObString &table_name = table_schema.get_table_name_str();
+    const ObString &column_name = column_schema.get_column_name_str();
+    // A NULL value means the result has not been produced yet (or generation
+    // failed permanently). Task rows cannot be used instead: with
+    // max_retries=0 they are deleted once the retry budget is spent while the
+    // column stays NULL.
+    //
+    // This probe runs on an inner connection, i.e. a different session whose
+    // ai_column_strict_read is the global default (off), so it cannot recurse
+    // into itself even when the user turned strict reads on for their session.
+    if (OB_FAIL(sql.append_fmt("select 1 from `%.*s`.`%.*s` where `%.*s` is null limit 1",
+                               db_name.length(), db_name.ptr(),
+                               table_name.length(), table_name.ptr(),
+                               column_name.length(), column_name.ptr()))) {
+    } else {
+      SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+        sqlclient::ObMySQLResult *result = nullptr;
+        if (OB_FAIL(sql_proxy->read(res, sql.ptr()))) {
+          LOG_WARN("ai column strict read: probe failed", K(ret), K(sql));
+        } else if (OB_ISNULL(result = res.get_result())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          ret = result->next();
+          if (OB_SUCCESS == ret) {
+            // at least one row still misses a value
+            ret = OB_AI_COLUMN_NOT_READY;
+            LOG_USER_ERROR(OB_AI_COLUMN_NOT_READY,
+                           table_schema.get_table_id(), column_schema.get_column_id());
+          } else if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDMLResolver::resolve_subquery_info(const ObIArray<ObSubQueryInfo> &subquery_info)
 {
   int ret = OB_SUCCESS;

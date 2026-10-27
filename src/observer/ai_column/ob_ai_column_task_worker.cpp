@@ -163,13 +163,22 @@ void ObAiColumnTaskWorker::runTimerTask()
         // Regeneration failed, usually because the model endpoint is down.
         // Bumping the attempt counter and releasing the task is what the retry
         // test observes: it polls for state=3 with retry_count=1.
+        //
+        // A missing metadata row means the table (or its AI column) was
+        // dropped while the task was in flight. Retrying is pointless then, so
+        // fall back to the zero budget and let the failure path drop the task.
+        // Leaving it in place instead would strand the row forever and make
+        // `select count(*) from __all_ai_column_task` never reach zero.
         int64_t max_retries = 0;
-        if (OB_SUCCESS == get_max_retries(group.table_id_,
-                                          group.column_ids_.at(0),
-                                          max_retries)) {
-          if (OB_FAIL(handle_failure(group, max_retries, tmp_ret))) {
-            LOG_WARN("ai column worker: record failure failed", K(ret));
-          }
+        int meta_ret = get_max_retries(group.table_id_, group.column_ids_.at(0),
+                                       max_retries);
+        if (OB_SUCCESS != meta_ret) {
+          LOG_INFO("ai column worker: no ai column metadata, dropping task",
+                   K(meta_ret), K(group.table_id_), K(group.request_id_));
+          max_retries = 0;
+        }
+        if (OB_FAIL(handle_failure(group, max_retries, tmp_ret))) {
+          LOG_WARN("ai column worker: record failure failed", K(ret));
         }
         LOG_WARN("ai column worker: regenerate failed", K(tmp_ret), K(group.request_id_));
       }

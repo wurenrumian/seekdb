@@ -19,7 +19,10 @@
 #include "sql/engine/dml/ob_ai_column_task_writer.h"
 
 #include <algorithm>
+#include <atomic>
+#include "common/mysqlclient/ob_mysql_proxy.h"
 #include "share/inner_table/ob_inner_table_schema_constants.h"
+#include "share/ob_server_struct.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/schema/ob_table_schema.h"
@@ -280,7 +283,18 @@ void fill_task_rowkey(blocksstable::ObDatumRow &row,
 
 int64_t ObAiColumnTaskWriter::gen_request_id()
 {
-  return ObTimeUtility::current_time();
+  // Must be unique per row level change: the worker groups tasks by this value
+  // and publishes a group with a single UPDATE built from one row's rowkey
+  // predicate, so two different changes sharing an id would let only one of
+  // them be regenerated. current_time() is not monotonic enough for that: two
+  // statements can land in the same microsecond.
+  static std::atomic<int64_t> last(0);
+  int64_t candidate = 0;
+  int64_t prev = last.load(std::memory_order_relaxed);
+  do {
+    candidate = std::max(prev + 1, ObTimeUtility::current_time());
+  } while (!last.compare_exchange_weak(prev, candidate, std::memory_order_relaxed));
+  return candidate;
 }
 
 uint64_t ObAiColumnTaskWriter::gen_task_id(uint64_t table_id,
@@ -573,6 +587,149 @@ int ObAiColumnTaskWriter::get_rowkey_columns(ObSchemaGetterGuard &schema_guard,
         LOG_WARN("ai column task: rowkey column not in schema", K(ret), K(column_id));
       } else if (OB_FAIL(rowkey_ids.push_back(column_id))) {
       } else if (OB_FAIL(rowkey_names.push_back(column->get_column_name_str()))) {
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAiColumnTaskWriter::collect_row_predicates(
+    ObSchemaGetterGuard &schema_guard,
+    uint64_t table_id,
+    const ObString &predicate,
+    ObIAllocator &allocator,
+    ObIArray<ObString> &out)
+{
+  int ret = OB_SUCCESS;
+  ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+  const ObTableSchema *table_schema = nullptr;
+  const ObDatabaseSchema *database_schema = nullptr;
+  ObSqlString sql;
+  ObSEArray<uint64_t, 4> rowkey_ids;
+  ObSEArray<ObString, 4> rowkey_names;
+  out.reset();
+  if (OB_ISNULL(sql_proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column task: null sql proxy", K(ret));
+  } else if (OB_FAIL(schema_guard.get_table_schema(table_id, table_schema))) {
+    LOG_WARN("ai column task: get data table schema failed", K(ret), K(table_id));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+  } else if (OB_FAIL(schema_guard.get_database_schema(table_schema->get_database_id(),
+                                                      database_schema))) {
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (OB_FAIL(get_rowkey_columns(schema_guard, table_id, rowkey_ids, rowkey_names))) {
+  } else {
+    // Select the raw primary key values and render them in C++, not in SQL.
+    // build_rowkey_predicate() renders the same values through
+    // ObObj::print_sql_literal; going through that exact routine is what keeps
+    // the task_id identical to the one an implicit invalidation produces for
+    // the same row (task_id is a hash of this text), so re-queueing stays
+    // idempotent. Rendering in SQL cannot match it: quote() would turn the
+    // integer 2 into '2'.
+    ObSqlString select_list;
+    const ObString &db_name = database_schema->get_database_name_str();
+    const ObString &table_name = table_schema->get_table_name_str();
+    for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_names.count(); ++i) {
+      const ObString &name = rowkey_names.at(i);
+      if (OB_FAIL(select_list.append_fmt("%s`%.*s`", i > 0 ? ", " : "",
+                                         name.length(), name.ptr()))) {
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(sql.append_fmt("select %.*s from `%.*s`.`%.*s`",
+                                      static_cast<int>(select_list.length()),
+                                      select_list.ptr(),
+                                      db_name.length(), db_name.ptr(),
+                                      table_name.length(), table_name.ptr()))) {
+    } else if (!predicate.empty()
+               && OB_FAIL(sql.append_fmt(" where %.*s",
+                                         predicate.length(), predicate.ptr()))) {
+    } else {
+      SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+        sqlclient::ObMySQLResult *result = nullptr;
+        if (OB_FAIL(sql_proxy->read(res, sql.ptr()))) {
+          LOG_WARN("ai column task: read retry rows failed", K(ret), K(sql));
+        } else if (OB_ISNULL(result = res.get_result())) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          const ObObjPrintParams print_params;
+          while (OB_SUCC(ret) && OB_SUCC(result->next())) {
+            char *buf = nullptr;
+            int64_t buf_len = 0;
+            int64_t pos = 0;
+            for (int64_t i = 0; OB_SUCC(ret) && i < rowkey_names.count(); ++i) {
+              ObObj obj;
+              const ObString &name = rowkey_names.at(i);
+              if (OB_FAIL(result->get_obj(static_cast<int64_t>(i), obj))) {
+                LOG_WARN("ai column task: read retry rowkey failed", K(ret), K(i));
+              } else if (i > 0 && OB_FAIL(databuff_printf(buf, buf_len, pos, allocator,
+                                                          " and "))) {
+              } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, allocator, "`%.*s` = ",
+                                                 name.length(), name.ptr()))) {
+              } else if (OB_FAIL(obj.print_sql_literal(buf, buf_len, pos, allocator,
+                                                       print_params))) {
+                LOG_WARN("ai column task: print retry rowkey failed", K(ret), K(obj));
+              }
+            }
+            if (OB_SUCC(ret)) {
+              ObString copied;
+              if (OB_FAIL(ob_write_string(allocator, ObString(static_cast<int32_t>(pos), buf),
+                                          copied))) {
+              } else if (OB_FAIL(out.push_back(copied))) {
+              }
+            }
+          }
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAiColumnTaskWriter::enqueue_task_rows(
+    ObExecContext &exec_ctx,
+    uint64_t table_id,
+    uint64_t ai_column_id,
+    const ObIArray<ObString> &row_predicates)
+{
+  int ret = OB_SUCCESS;
+  ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  if (row_predicates.empty()) {
+    // zero-row predicate: a no-op, no task rows must appear
+  } else if (OB_ISNULL(sql_proxy)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ai column task: null sql proxy", K(ret));
+  } else {
+    // One request id per task row. The worker groups tasks by request_id to
+    // publish them atomically, so sharing one id across rows would make it
+    // treat the whole retry statement as a single row: it would build the
+    // update from one rowkey predicate and regenerate only that row, while the
+    // others stay NULL forever.
+    for (int64_t i = 0; OB_SUCC(ret) && i < row_predicates.count(); ++i) {
+      const ObString &row_predicate = row_predicates.at(i);
+      const uint64_t task_id = gen_task_id(table_id, ai_column_id, row_predicate);
+      const int64_t request_id = gen_request_id() + i;
+      sql.reuse();
+      if (OB_FAIL(sql.append_fmt(
+              "insert into %s (gmt_create, gmt_modified, table_id, column_id, "
+              "task_id, request_id, rowkey_predicate, eligible_ts, state, retry_count) "
+              "values (now(6), now(6), %lu, %lu, %lu, %ld, '%.*s', now(6), %d, 0) "
+              "on duplicate key update request_id = values(request_id), "
+              "rowkey_predicate = values(rowkey_predicate), eligible_ts = now(6), "
+              "state = %d, retry_count = 0, error_message = NULL, gmt_modified = now(6)",
+              OB_ALL_AI_COLUMN_TASK_TNAME, table_id, ai_column_id, task_id,
+              request_id, row_predicate.length(), row_predicate.ptr(),
+              AI_TASK_PENDING_STATE, AI_TASK_PENDING_STATE))) {
+        LOG_WARN("ai column task: build task insert failed", K(ret));
+      } else if (OB_FAIL(sql_proxy->write(sql.ptr(), affected_rows))) {
+        LOG_WARN("ai column task: insert task row failed", K(ret), K(sql));
       }
     }
   }

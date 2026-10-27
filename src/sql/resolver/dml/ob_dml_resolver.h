@@ -475,6 +475,26 @@ protected:
     ObDMLStmt *stmt = NULL);
   virtual int resolve_subquery_info(const common::ObIArray<ObSubQueryInfo> &subquery_info);
   virtual int resolve_inlist_info(common::ObIArray<ObInListInfo> &inlist_infos);
+
+  // Reject a statement that touches an AI column which still has unfinished
+  // work, when the session enabled `ai_column_strict_read`.
+  //
+  // Strictness is column wide, not row wide: a statement that references the
+  // column at all fails, even if every row it selects happens to be ready,
+  // because a partially generated column cannot be interpreted as a whole.
+  //
+  // The test is "the column has a row without a value", not "the task table has
+  // a pending row": a table created with max_retries=0 drops task rows as soon
+  // as generation fails, and the result column then stays NULL forever. Only
+  // the data column reflects that.
+  //
+  // Must be called after the statement is fully resolved, so that get column
+  // items cover the select list, the WHERE clause and joined subqueries alike.
+  int check_ai_column_strict_read(ObDMLStmt *stmt);
+  // Fail with OB_AI_COLUMN_NOT_READY if any row of the column still has no
+  // value.
+  int check_ai_column_ready(const share::schema::ObTableSchema &table_schema,
+                            const share::schema::ObColumnSchemaV2 &column_schema);
   virtual int resolve_aggr_exprs(ObRawExpr *&expr, common::ObIArray<ObAggFunRawExpr*> &aggr_exprs,
                                  const bool need_analyze = true);
   virtual int resolve_win_func_exprs(ObRawExpr *&expr, common::ObIArray<ObWinFunRawExpr*> &win_exprs);

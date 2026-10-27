@@ -111,6 +111,8 @@ int ObDeleteResolver::resolve(const ParseNode &parse_tree)
       } else if (OB_FAIL(delete_stmt->check_dml_need_filter_null())) {
       } else if (OB_FAIL(delete_stmt->check_dml_source_from_join())) {
       } else if (OB_FAIL(check_safe_update_mode(delete_stmt, is_multi_table_delete))) {
+      } else if (OB_FAIL(check_ai_column_strict_read(delete_stmt))) {
+        LOG_WARN("ai column strict read failed", K(ret));
       } else { /*do nothing */ }
     }
   }

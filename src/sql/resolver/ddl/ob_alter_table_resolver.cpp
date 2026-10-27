@@ -594,8 +594,10 @@ int ObAlterTableResolver::resolve_action_list(const ParseNode &node)
             // with another ALTER action.
             if (1 != node.num_child_) {
               ret = OB_NOT_SUPPORTED;
+              // OB_NOT_SUPPORTED appends " not supported", so the text must not
+              // repeat it.
               LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                             "combining AI COLUMN RETRY with another ALTER action not supported");
+                             "combining AI COLUMN RETRY with another ALTER action");
             } else if (OB_FAIL(resolve_retry_ai_column(*action_node))) {
             }
             break;
@@ -878,6 +880,12 @@ int ObAlterTableResolver::resolve_drop_column_nodes_for_mysql(
   return ret;
 }
 
+// Rewrite STATUS pseudo-column references in a retry predicate; defined below.
+static int rewrite_retry_status_pseudo_column(const ObString &pred,
+                                              const ObString &ai_column_name,
+                                              ObIAllocator &allocator,
+                                              ObString &out);
+
 int ObAlterTableResolver::resolve_retry_ai_column(const ParseNode &node)
 {
   int ret = OB_SUCCESS;
@@ -899,10 +907,12 @@ int ObAlterTableResolver::resolve_retry_ai_column(const ParseNode &node)
                      table_schema_->get_table_name_str().length(),
                      table_schema_->get_table_name_str().ptr());
     } else if (!column_schema->is_ai_column()) {
-      // Only an AI column holds a derived value that can be regenerated.
+      // Only an AI column holds a derived value that can be regenerated. The
+      // message is what the acceptance test compares, and OB_NOT_SUPPORTED
+      // appends " not supported" itself, so it must not be part of the text.
       ret = OB_NOT_SUPPORTED;
       LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                     "retrying a column that is not an AI column not supported");
+                     "retrying a column that is not an AI column");
     } else {
       alter_table_stmt->set_alter_table_ai_column_retry(column_schema->get_column_id());
       // The retry path does not go through a column action, so the executor
@@ -926,14 +936,205 @@ int ObAlterTableResolver::resolve_retry_ai_column(const ParseNode &node)
           if (pred.empty()) {
             // `where` with no predicate cannot happen: the grammar requires an
             // expression, so treat it as absent rather than retrying everything.
-          } else if (OB_FAIL(ob_write_string(alter_table_stmt->get_alter_table_arg().allocator_,
-                                             pred, copied))) {
-            SQL_RESV_LOG(WARN, "copy ai column retry predicate failed", K(ret));
+          } else if (OB_FAIL(rewrite_retry_status_pseudo_column(
+                         pred, column_schema->get_column_name_str(),
+                         alter_table_stmt->get_alter_table_arg().allocator_, copied))) {
+            SQL_RESV_LOG(WARN, "rewrite ai column retry predicate failed", K(ret), K(pred));
           } else {
             alter_table_stmt->get_alter_table_arg().ai_column_retry_predicate_ = copied;
           }
         }
       }
+    }
+  }
+  return ret;
+}
+
+// Replace STATUS pseudo-column references in a retry predicate with the
+// readiness of the AI column being retried.
+//
+// STATUS only exists inside this predicate and says whether the AI column still
+// has to be (re)generated: 'READY' means a value is present, 'FAILED' means it
+// is missing. A backquoted `status` is left untouched: it addresses the real
+// column of that name when the table has one.
+//
+// Only the shapes `status = 'READY'` and `status = 'FAILED'` (plus != and <>)
+// are rewritten. Anything else is passed through to the real column, which
+// keeps the failure mode obvious instead of guessing.
+namespace {
+
+bool is_ident_start(char c)
+{
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || '_' == c;
+}
+
+bool is_ident_char(char c)
+{
+  return is_ident_start(c) || (c >= '0' && c <= '9') || '$' == c;
+}
+
+// Advance past spaces and comments so `status  /*x*/ = 'READY'` still matches.
+int skip_blanks(const char *ptr, const int64_t len, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  bool moved = true;
+  while (OB_SUCC(ret) && moved) {
+    moved = false;
+    while (pos < len && (' ' == ptr[pos] || '\t' == ptr[pos]
+                         || '\n' == ptr[pos] || '\r' == ptr[pos])) {
+      ++pos;
+      moved = true;
+    }
+    if (pos + 1 < len && '/' == ptr[pos] && '*' == ptr[pos + 1]) {
+      pos += 2;
+      while (pos + 1 < len && !('*' == ptr[pos] && '/' == ptr[pos + 1])) {
+        ++pos;
+      }
+      if (pos + 1 >= len) {
+        ret = OB_ERR_PARSER_SYNTAX;
+      } else {
+        pos += 2;
+        moved = true;
+      }
+    }
+  }
+  return ret;
+}
+
+} // namespace
+
+static int rewrite_retry_status_pseudo_column(const ObString &pred,
+                                              const ObString &ai_column_name,
+                                              ObIAllocator &allocator,
+                                              ObString &out)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString rewritten;
+  const char *ptr = pred.ptr();
+  const int64_t len = static_cast<int64_t>(pred.length());
+  int64_t pos = 0;
+  while (OB_SUCC(ret) && pos < len) {
+    const char c = ptr[pos];
+    if ('\'' == c || '"' == c) {
+      // String literal: copy verbatim, honouring '' and backslash escapes.
+      const char quote = c;
+      int64_t end = pos + 1;
+      while (end < len) {
+        if ('\\' == ptr[end] && end + 1 < len) {
+          end += 2;
+        } else if (quote == ptr[end]) {
+          if (end + 1 < len && quote == ptr[end + 1]) {
+            end += 2;
+          } else {
+            ++end;
+            break;
+          }
+        } else {
+          ++end;
+        }
+      }
+      if (OB_FAIL(rewritten.append(ptr + pos, end - pos))) {
+      } else {
+        pos = end;
+      }
+    } else if ('`' == c) {
+      // Backquoted identifier: addresses the real column, never the pseudo one.
+      int64_t end = pos + 1;
+      while (end < len && '`' != ptr[end]) {
+        ++end;
+      }
+      end = end < len ? end + 1 : len;
+      if (OB_FAIL(rewritten.append(ptr + pos, end - pos))) {
+      } else {
+        pos = end;
+      }
+    } else if (is_ident_start(c)) {
+      int64_t end = pos + 1;
+      while (end < len && is_ident_char(ptr[end])) {
+        ++end;
+      }
+      const ObString ident(static_cast<int32_t>(end - pos), ptr + pos);
+      if (0 != ident.case_compare("status")) {
+        if (OB_FAIL(rewritten.append(ptr + pos, end - pos))) {
+        } else {
+          pos = end;
+        }
+      } else {
+        int64_t cursor = end;
+        bool negated = false;
+        bool recognised = true;
+        if (OB_FAIL(skip_blanks(ptr, len, cursor))) {
+        } else if (cursor < len && '=' == ptr[cursor]) {
+          ++cursor;
+        } else if (cursor + 1 < len && ('!' == ptr[cursor] || '<' == ptr[cursor])
+                   && '=' == ptr[cursor + 1]) {
+          negated = true;
+          cursor += 2;
+        } else if (cursor + 1 < len && '<' == ptr[cursor] && '>' == ptr[cursor + 1]) {
+          negated = true;
+          cursor += 2;
+        } else {
+          recognised = false;
+        }
+        ObString value;
+        if (OB_FAIL(ret)) {
+        } else if (recognised) {
+          if (OB_FAIL(skip_blanks(ptr, len, cursor))) {
+          } else if (cursor < 0 || cursor >= len
+                     || ('\'' != ptr[cursor] && '"' != ptr[cursor])) {
+            recognised = false;
+          } else {
+            const char quote = ptr[cursor];
+            const int64_t value_start = cursor + 1;
+            int64_t value_end = value_start;
+            while (value_end < len && quote != ptr[value_end]) {
+              ++value_end;
+            }
+            if (value_end >= len) {
+              recognised = false;
+            } else {
+              value.assign_ptr(ptr + value_start, static_cast<int32_t>(value_end - value_start));
+              cursor = value_end + 1;
+            }
+          }
+        }
+        bool is_ready = false;
+        if (OB_FAIL(ret)) {
+        } else if (!recognised) {
+          // Unrecognised shape: pass the identifier through to the real column.
+          if (OB_FAIL(rewritten.append(ptr + pos, end - pos))) {
+          } else {
+            pos = end;
+          }
+        } else if (0 == value.case_compare("READY")) {
+          is_ready = true;
+        } else if (0 == value.case_compare("FAILED")) {
+          is_ready = false;
+        } else {
+          ret = OB_INVALID_ARGUMENT;
+          SQL_RESV_LOG(WARN, "STATUS only accepts 'READY' or 'FAILED'", K(ret), K(value));
+        }
+        if (OB_SUCC(ret) && recognised) {
+          // READY <=> a value is present; the negation flips the two.
+          const bool want_present = negated ? !is_ready : is_ready;
+          if (OB_FAIL(rewritten.append_fmt("`%.*s` is %snull",
+                                           ai_column_name.length(), ai_column_name.ptr(),
+                                           want_present ? "not " : ""))) {
+          } else {
+            pos = cursor;
+          }
+        }
+      }
+    } else {
+      if (OB_FAIL(rewritten.append_fmt("%c", c))) {
+      } else {
+        ++pos;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(ob_write_string(allocator, rewritten.string(), out))) {
+      SQL_RESV_LOG(WARN, "copy rewritten predicate failed", K(ret));
     }
   }
   return ret;

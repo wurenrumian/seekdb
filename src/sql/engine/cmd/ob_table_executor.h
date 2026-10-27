@@ -116,6 +116,12 @@ private:
   int execute_retry_ai_column(ObExecContext &ctx,
                               ObAlterTableStmt &stmt,
                               obcall::ObAlterTableArg &alter_table_arg);
+  // Reset the AI column of every row the retry predicate selects.
+  int reset_ai_column_values(share::schema::ObSchemaGetterGuard &schema_guard,
+                             const share::schema::ObTableSchema &table_schema,
+                             const share::schema::ObColumnSchemaV2 &ai_column,
+                             const share::schema::ObDatabaseSchema &database_schema,
+                             const common::ObString &predicate);
   static const int64_t TIME_INTERVAL_PER_PART_US = 50 * 1000; // 50ms
   static const int64_t MAX_WAIT_CHECK_SCHEMA_VERSION_INTERVAL_US = 120LL * 1000000LL; // 120s
   static const int64_t MIN_WAIT_CHECK_SCHEMA_VERSION_INTERVAL_US = 20LL * 1000000LL; // 20s
