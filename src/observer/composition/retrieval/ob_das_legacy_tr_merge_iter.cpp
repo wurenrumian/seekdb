@@ -16,6 +16,7 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "observer/composition/retrieval/ob_das_legacy_tr_merge_iter.h"
+#include "data_plane/fts/ob_fts_result_cache.h"
 #include "sql/das/iter/ob_das_scan_iter.h"
 #include "sql/das/iter/ob_das_text_retrieval_eval_node.h"
 #include "sql/das/iter/sparse_retrieval/ob_das_text_retrieval_engine.h"
@@ -1011,13 +1012,139 @@ static int get_query_tokens_directly(ObString &query_str,
   return ret;
 }
 
+namespace
+{
+
+const int64_t QUERY_TOKEN_COUNT_LEN = static_cast<int64_t>(sizeof(int32_t));
+const int64_t QUERY_TOKEN_LEN_LEN = static_cast<int64_t>(sizeof(int32_t));
+const char QUERY_TOKEN_CACHE_KEY_SEPARATOR = '\1';
+
+void append_key_item(const ObString &item, char *buf, int64_t &pos)
+{
+  if (item.length() > 0 && OB_NOT_NULL(item.ptr())) {
+    MEMCPY(buf + pos, item.ptr(), item.length());
+    pos += item.length();
+  }
+  buf[pos++] = QUERY_TOKEN_CACHE_KEY_SEPARATOR;
+}
+
+// The analysis of a query text depends on the parser, its properties and the collation of the
+// matched column, so all of them take part in the key.
+int build_query_token_cache_key(const ObString &search_text,
+                                const ObString &parser_name,
+                                const ObString &parser_properties,
+                                const ObObjMeta &meta,
+                                ObIAllocator &alloc,
+                                ObString &key,
+                                bool &cacheable)
+{
+  int ret = OB_SUCCESS;
+  cacheable = false;
+  const int64_t total = parser_name.length() + parser_properties.length() + search_text.length()
+                        + QUERY_TOKEN_LEN_LEN + 4;
+  if (OB_UNLIKELY(total > storage::ObFtsResultCache::MAX_KEY_LEN)) {
+    // too long to be worth caching, the caller analyses the text anyway
+  } else {
+    char *buf = static_cast<char *>(alloc.alloc(total));
+    if (OB_ISNULL(buf)) {
+      // a failed allocation only means no caching
+    } else {
+      int64_t pos = 0;
+      append_key_item(parser_name, buf, pos);
+      append_key_item(search_text, buf, pos);
+      const int32_t cs_type = static_cast<int32_t>(meta.get_collation_type());
+      MEMCPY(buf + pos, &cs_type, QUERY_TOKEN_LEN_LEN);
+      pos += QUERY_TOKEN_LEN_LEN;
+      buf[pos++] = QUERY_TOKEN_CACHE_KEY_SEPARATOR;
+      append_key_item(parser_properties, buf, pos);
+      key.assign_ptr(buf, static_cast<int32_t>(pos));
+      cacheable = true;
+    }
+  }
+  return ret;
+}
+
+// A cached token list is (count:int32) followed by (len:int32, bytes) for every token.
+void cache_query_tokens(const ObString &key,
+                        const ObIArray<ObString> &query_tokens,
+                        ObIAllocator &alloc)
+{
+  int64_t total = QUERY_TOKEN_COUNT_LEN;
+  for (int64_t i = 0; i < query_tokens.count(); ++i) {
+    total += QUERY_TOKEN_LEN_LEN + query_tokens.at(i).length();
+  }
+  if (query_tokens.empty() || total > storage::ObFtsResultCache::MAX_VALUE_LEN) {
+    // an empty token list is not cached, so a hit always yields at least one token
+  } else {
+    char *buf = static_cast<char *>(alloc.alloc(total));
+    if (OB_ISNULL(buf)) {
+      // the query has already been analyzed, losing the entry only costs the next query
+    } else {
+      int64_t pos = 0;
+      const int32_t count = static_cast<int32_t>(query_tokens.count());
+      MEMCPY(buf + pos, &count, QUERY_TOKEN_COUNT_LEN);
+      pos += QUERY_TOKEN_COUNT_LEN;
+      for (int64_t i = 0; i < query_tokens.count(); ++i) {
+        const int32_t len = query_tokens.at(i).length();
+        MEMCPY(buf + pos, &len, QUERY_TOKEN_LEN_LEN);
+        pos += QUERY_TOKEN_LEN_LEN;
+        if (len > 0) {
+          MEMCPY(buf + pos, query_tokens.at(i).ptr(), len);
+          pos += len;
+        }
+      }
+      storage::ObFtsResultCache::instance().put(key, buf, pos);
+    }
+  }
+}
+
+// Best effort: a malformed entry leaves the token list empty so the caller analyzes the text.
+void deserialize_query_tokens(const ObString &value,
+                              ObIAllocator &alloc,
+                              ObIArray<ObString> &query_tokens)
+{
+  bool valid = value.length() >= QUERY_TOKEN_COUNT_LEN;
+  int32_t count = 0;
+  int64_t pos = 0;
+  if (valid) {
+    MEMCPY(&count, value.ptr(), QUERY_TOKEN_COUNT_LEN);
+    pos += QUERY_TOKEN_COUNT_LEN;
+    valid = count > 0 && count <= value.length();
+  }
+  for (int32_t i = 0; valid && i < count; ++i) {
+    if (pos + QUERY_TOKEN_LEN_LEN > value.length()) {
+      valid = false;
+    } else {
+      int32_t len = 0;
+      MEMCPY(&len, value.ptr() + pos, QUERY_TOKEN_LEN_LEN);
+      pos += QUERY_TOKEN_LEN_LEN;
+      ObString token;
+      if (len < 0 || pos + len > value.length()) {
+        valid = false;
+      } else if (OB_SUCCESS != ob_write_string(alloc, ObString(len, value.ptr() + pos), token)) {
+        valid = false;
+      } else if (OB_SUCCESS != query_tokens.push_back(token)) {
+        valid = false;
+      } else {
+        pos += len;
+      }
+    }
+  }
+  if (!valid) {
+    query_tokens.reuse();
+  }
+}
+
+}  // namespace
+
+
 int ObDASLegacyTRMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_ctdef,
-                                         ObDASIRScanRtDef *ir_rtdef,
-                                         common::ObIAllocator &alloc,
-                                         ObArray<ObString> &query_tokens,
-                                         ObArray<double> &boost_values,
-                                         ObFtsEvalNode *&root_node,
-                                         bool &has_duplicate_boolean_tokens)
+                                               ObDASIRScanRtDef *ir_rtdef,
+                                               common::ObIAllocator &alloc,
+                                               ObArray<ObString> &query_tokens,
+                                               ObArray<double> &boost_values,
+                                               ObFtsEvalNode *&root_node,
+                                               bool &has_duplicate_boolean_tokens)
 {
   int ret = OB_SUCCESS;
   has_duplicate_boolean_tokens = false;
@@ -1109,32 +1236,60 @@ int ObDASLegacyTRMergeIter::build_query_tokens(const ObDASIRScanCtDef *ir_ctdef,
   } else {
     // TODO: FTParseHelper currently does not support deduplicate tokens
     //       We should abstract such universal analyse functors into utility structs
+    //
+    // The analysis below only depends on the query text, the parser and the collation, and the
+    // dictionaries it borrows are loaded once per process, so the token list of an unchanged query
+    // text is reusable. Every query of a repeated statement (and every partition of one query in a
+    // partitioned table) would otherwise redo the parser setup and the segmentation again.
     const ObString &search_text_string = search_text_datum->get_string();
     const ObString &parser_name = ir_ctdef->get_inv_idx_scan_ctdef()->table_param_.get_parser_name();
     const ObString &parser_properties = ir_ctdef->get_inv_idx_scan_ctdef()->table_param_.get_parser_property();
 
     const ObObjMeta &meta = search_text->obj_meta_;
-    int64_t doc_length = 0;
-    storage::ObFTParseHelper tokenize_helper;
-    common::ObSEArray<ObFTWord, 16> tokens;
-    storage::ObFTWordMap token_map;
-    const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
-    if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
-    } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
-    } else if (OB_FAIL(tokenize_helper.segment(
-                           meta,
-                           search_text_string.ptr(),
-                           search_text_string.length(),
-                           doc_length,
-                           token_map))) {
+    ObString cache_key;
+    ObString cache_value;
+    bool cacheable = false;
+    bool cache_hit = false;
+    if (OB_FAIL(build_query_token_cache_key(search_text_string, parser_name, parser_properties,
+                                            meta, alloc, cache_key, cacheable))) {
+    } else if (cacheable) {
+      storage::ObFtsResultCache::instance().get(cache_key, alloc, cache_hit, cache_value);
+    }
+
+    if (OB_FAIL(ret)) {
     } else {
-      for (storage::ObFTWordMap::const_iterator iter = token_map.begin();
-          OB_SUCC(ret) && iter != token_map.end();
-          ++iter) {
-        const ObFTWord &token = iter->first;
-        ObString token_string;
-        if (OB_FAIL(ob_write_string(alloc, token.get_word().get_string(), token_string))) {
-        } else if (OB_FAIL(query_tokens.push_back(token_string))) {
+      if (cache_hit) {
+        deserialize_query_tokens(cache_value, alloc, query_tokens);
+      }
+      if (!query_tokens.empty()) {
+        // served from the cache
+      } else {
+        int64_t doc_length = 0;
+        storage::ObFTParseHelper tokenize_helper;
+        common::ObSEArray<ObFTWord, 16> tokens;
+        storage::ObFTWordMap token_map;
+        const int64_t ft_word_bkt_cnt = MAX(search_text_string.length() / 10, 2);
+        if (OB_FAIL(tokenize_helper.init(&alloc, parser_name, parser_properties))) {
+        } else if (OB_FAIL(token_map.create(ft_word_bkt_cnt, common::ObMemAttr("FTWordMap")))) {
+        } else if (OB_FAIL(tokenize_helper.segment(
+                               meta,
+                               search_text_string.ptr(),
+                               search_text_string.length(),
+                               doc_length,
+                               token_map))) {
+        } else {
+          for (storage::ObFTWordMap::const_iterator iter = token_map.begin();
+              OB_SUCC(ret) && iter != token_map.end();
+              ++iter) {
+            const ObFTWord &token = iter->first;
+            ObString token_string;
+            if (OB_FAIL(ob_write_string(alloc, token.get_word().get_string(), token_string))) {
+            } else if (OB_FAIL(query_tokens.push_back(token_string))) {
+            }
+          }
+          if (OB_SUCC(ret) && cacheable) {
+            cache_query_tokens(cache_key, query_tokens, alloc);
+          }
         }
       }
     }
