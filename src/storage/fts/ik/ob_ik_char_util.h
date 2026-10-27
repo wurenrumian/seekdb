@@ -445,27 +445,29 @@ template <ObCharsetType CS_TYPE>
 inline int ObFTCharUtil::do_classify(const char *input, const uint8_t char_len, CharType &type)
 {
   int ret = OB_SUCCESS;
-  bool checker = false;
+  ob_wc_t unicode = 0;
   type = CharType::USELESS;
-
-  if (OB_FAIL(is_alpha<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
+  // Probe the categories of one character off a single decode. Probing them one
+  // after another decodes the same character again for every category that does
+  // not match, which is up to six decodes for the punctuation and CJK input that
+  // most documents are made of.
+  if (OB_FAIL(decode_unicode<CS_TYPE>(input, char_len, unicode))) {
+  } else if (ObUnicodeBlockUtils::is_alpha(unicode)) {
     type = CharType::ENGLISH_LETTER;
-  } else if (OB_FAIL(is_arabic<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
+  } else if (ObUnicodeBlockUtils::is_arabic(unicode)) {
     type = CharType::ARABIC_LETTER;
-  } else if (OB_FAIL(is_chinese<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
+  } else if (ObUnicodeBlockUtils::is_chinese(unicode)) {
     type = CharType::CHINESE;
-  } else if (OB_FAIL(is_other_cjk<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
+  } else if (ObUnicodeBlockUtils::is_other_cjk(unicode)) {
     type = CharType::OTHER_CJK;
-  } else if (OB_FAIL(is_surrogate_high<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
-    type = CharType::SURROGATE_HIGH;
-  } else if (OB_FAIL(is_surrogate_low<CS_TYPE>(input, char_len, checker))) {
-  } else if (checker) {
-    type = CharType::SURROGATE_LOW;
+  } else if constexpr (CS_TYPE == CHARSET_UTF16 || CS_TYPE == CHARSET_UTF16LE) {
+    // Surrogates only exist for the UTF16 charsets; the checks of the other
+    // charsets report false without looking at the character.
+    if (ObUnicodeBlockUtils::check_high_surrogate(unicode)) {
+      type = CharType::SURROGATE_HIGH;
+    } else if (ObUnicodeBlockUtils::check_low_surrogate(unicode)) {
+      type = CharType::SURROGATE_LOW;
+    }
   }
   return ret;
 }
