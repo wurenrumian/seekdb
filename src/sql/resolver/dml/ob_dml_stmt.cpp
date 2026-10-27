@@ -194,6 +194,7 @@ int TableItem::deep_copy(ObIRawExprCopier &expr_copier,
   } else if (OB_FAIL(part_names_.assign(other.part_names_))) {
   } else if (is_values_table() &&
              OB_FAIL(deep_copy_values_table_def(*other.values_table_def_, expr_copier, allocator))) {
+  } else if (is_file_table() && OB_FAIL(deep_copy_file_table_def(*other.file_table_def_, allocator))) {
   } else { /* do nothing */ }
   if (OB_SUCC(ret)) {
     if (OB_ISNULL(other.sample_info_)) {
@@ -1557,6 +1558,7 @@ int ObDMLStmt::formalize_stmt_expr_reference(ObRawExprFactory *expr_factory,
         ret = OB_ERR_UNEXPECTED;
       } else if (table_item->is_function_table() ||
                  table_item->is_json_table() ||
+                 table_item->is_file_table() ||
                  table_item->for_update_ ||
                  table_item->is_values_table()) {
         if (OB_FAIL(set_sharable_expr_reference(*column_item.expr_, ExplicitedRefType::REF_BY_NORMAL))) {
@@ -4448,6 +4450,49 @@ int ObJsonTableDef::deep_copy(const ObJsonTableDef& src, ObIRawExprCopier &expr_
   return ret;
 }
 
+
+int ObFileTableDef::deep_copy(const ObFileTableDef &src, common::ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(allocator)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    file_path_ = src.file_path_;
+    function_type_ = src.function_type_;
+    has_header_ = src.has_header_;
+    delimiter_ = src.delimiter_;
+    quote_ = src.quote_;
+    escape_ = src.escape_;
+    null_string_ = src.null_string_;
+    file_size_ = src.file_size_;
+    file_mtime_ = src.file_mtime_;
+    file_ino_ = src.file_ino_;
+    columns_.reuse();
+    for (int64_t i = 0; OB_SUCC(ret) && i < src.columns_.count(); ++i) {
+      if (OB_FAIL(columns_.push_back(src.columns_.at(i)))) {
+        LOG_WARN("failed to copy file column", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int TableItem::deep_copy_file_table_def(const ObFileTableDef &src, common::ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  void *buf = NULL;
+  if (OB_ISNULL(file_table_def_)) {
+    if (OB_ISNULL(buf = allocator->alloc(sizeof(ObFileTableDef)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate file table def", K(ret));
+    } else {
+      file_table_def_ = new (buf) ObFileTableDef();
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(file_table_def_->deep_copy(src, allocator))) {
+  }
+  return ret;
+}
 
 int TableItem::deep_copy_values_table_def(const ObValuesTableDef& table_def,
                                           ObIRawExprCopier &expr_copier,

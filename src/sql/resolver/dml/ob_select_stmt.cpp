@@ -62,7 +62,9 @@ int ObSelectIntoItem::deep_copy(ObIAllocator &allocator,
   cs_type_ = other.cs_type_;
   buffer_size_ = other.buffer_size_;
   user_vars_.assign(other.user_vars_);
+  has_header_ = other.has_header_;
   if (OB_FAIL(ob_write_string(allocator, other.external_properties_, external_properties_))) {
+  } else if (OB_FAIL(ob_write_string(allocator, other.null_string_, null_string_))) {
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < other.pl_vars_.count(); ++i) {
     ObRawExpr* pl_var;
@@ -1044,6 +1046,7 @@ int ObSelectStmt::is_query_deterministic(bool &is_deterministic) const
                  table_item->is_values_table() ||
                  table_item->is_json_table() ||
                  table_item->is_function_table() ||
+                 table_item->is_file_table() ||
                  table_item->is_fake_cte_table()) {
         /* do nothing */
       } else if (table_item->is_generated_table() ||

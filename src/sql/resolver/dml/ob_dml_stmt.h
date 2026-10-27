@@ -129,6 +129,40 @@ struct ObValuesTableDef {
                        K(access_type_), K(is_const_), K(column_types_));
 };
 
+struct ObFileColumnDef
+{
+  ObFileColumnDef() : column_name_(), column_type_(0), nullable_(true), source_index_(0) {}
+  common::ObString column_name_;
+  // FileColumnType: 0 NULL, 1 BIGINT, 2 DOUBLE, 3 BOOLEAN, 4 VARCHAR, 5 DATE, 6 DATETIME
+  int64_t column_type_;
+  bool nullable_;
+  int64_t source_index_;
+  TO_STRING_KV(K_(column_name), K_(column_type), K_(nullable), K_(source_index));
+};
+
+struct ObFileTableDef
+{
+  ObFileTableDef()
+    : file_path_(), function_type_(0), has_header_(true), delimiter_(','), quote_('"'),
+      escape_('\\'), null_string_(), columns_(),
+      file_size_(-1), file_mtime_(-1), file_ino_(0) {}
+  int deep_copy(const ObFileTableDef &src, common::ObIAllocator *allocator);
+  common::ObString file_path_;
+  // 0 read_csv, 1 read_json, 2 read_parquet, 3 glob
+  int64_t function_type_;
+  bool has_header_;
+  char delimiter_;
+  char quote_;
+  char escape_;
+  common::ObString null_string_;
+  common::ObSEArray<ObFileColumnDef, 16, common::ModulePageAllocator, true> columns_;
+  int64_t file_size_;
+  int64_t file_mtime_;
+  int64_t file_ino_;
+  TO_STRING_KV(K_(file_path), K_(function_type), K_(has_header), K_(columns),
+               K_(file_size), K_(file_mtime));
+};
+
 struct TableItem
 {
   TableItem()
@@ -155,6 +189,7 @@ struct TableItem
     json_table_def_ = nullptr;
     table_type_ = MAX_TABLE_TYPE;
     values_table_def_ = NULL;
+    file_table_def_ = NULL;
     sample_info_ = nullptr;
   }
 
@@ -190,6 +225,7 @@ struct TableItem
     JSON_TABLE,
     VALUES_TABLE,
     LATERAL_TABLE,
+    FILE_TABLE,
   };
 
   /**
@@ -224,6 +260,7 @@ struct TableItem
   bool is_function_table() const { return FUNCTION_TABLE == type_; }
   bool is_json_table() const { return JSON_TABLE == type_; }  // json_table_def_->table_type_ == MulModeTableType::OB_ORA_JSON_TABLE_TYPE
   bool is_values_table() const { return VALUES_TABLE == type_; }//used to mark values statement: values row(1,2), row(3,4);
+  bool is_file_table() const { return FILE_TABLE == type_; }
 
   bool is_lateral_table() const { return LATERAL_TABLE == type_; }
   bool is_extended_all_or_user_sys_view() const
@@ -263,6 +300,7 @@ struct TableItem
   int deep_copy_values_table_def(const ObValuesTableDef& table_def,
                                  ObIRawExprCopier &expr_copier,
                                  ObIAllocator* allocator);
+  int deep_copy_file_table_def(const ObFileTableDef& table_def, ObIAllocator* allocator);
   virtual bool has_for_update() const { return for_update_; }
   // if real table id, it is valid for all threads,
   // else if generated id, it is unique just during the thread session
@@ -303,6 +341,8 @@ struct TableItem
   ObJsonTableDef *json_table_def_;
   // values table
   ObValuesTableDef *values_table_def_;
+  // file table (read_csv/read_json/read_parquet/glob)
+  ObFileTableDef *file_table_def_;
   // sample scan infos
   SampleInfo *sample_info_;
 };

@@ -17,10 +17,57 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ddl/ob_explain_resolver.h"
 #include "sql/resolver/ob_resolver.h"
+#include "sql/resolver/dml/ob_select_stmt.h"
+#include "sql/resolver/dml/ob_select_resolver.h"
+#include "sql/parser/ob_parser.h"
+#include "lib/string/ob_sql_string.h"
 
 using namespace oceanbase;
 using namespace sql;
 using namespace common;
+namespace oceanbase
+{
+namespace sql
+{
+namespace
+{
+
+// Escape a value for use inside a single quoted SQL literal.
+int append_sql_literal(ObSqlString &sql, const ObString &value)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+    const char c = value.ptr()[i];
+    if ('\'' == c || '\\' == c) {
+      char buf[2] = {'\\', c};
+      ret = sql.append(buf, 2);
+    } else {
+      char buf[1] = {c};
+      ret = sql.append(buf, 1);
+    }
+  }
+  return ret;
+}
+
+const char *file_column_type_name(int64_t column_type)
+{
+  const char *name = "VARCHAR";
+  switch (column_type) {
+    case 1: name = "BIGINT"; break;
+    case 2: name = "DOUBLE"; break;
+    case 3: name = "BOOLEAN"; break;
+    case 4: name = "VARCHAR"; break;
+    case 5: name = "DATE"; break;
+    case 6: name = "DATETIME"; break;
+    default: name = "VARCHAR"; break;
+  }
+  return name;
+}
+
+} // anonymous namespace
+} // namespace sql
+} // namespace oceanbase
+
 const static int64_t EXPLAIN_FORMAT = 0;
 const static int64_t EXPLAIN_DISPLAY_OPTION = 1;
 const static int64_t EXPLAIN_INTO_TABLE = 2;
@@ -41,6 +88,7 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
   } else {
     ParseNode *child_node = parse_tree.children_[EXPLAIN_CHILD_STMT];
     ObStmt *child_stmt = NULL;
+    bool rewritten = false;
     ObExplainDisplayOpt opt;
     opt.with_tree_line_ = true;
     if (OB_ISNULL(child_node)) {
@@ -62,6 +110,11 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
       } else if (OB_ISNULL(child_stmt)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("failed to generate stmt for child stmt");
+      } else if (parse_tree.param_num_ > 0 &&
+                 OB_FAIL(rewrite_file_describe(child_stmt, rewritten))) {
+        LOG_WARN("failed to rewrite describe for file table", K(ret));
+      } else if (rewritten) {
+        // stmt_ has been replaced by the generated metadata query
       } else {
         explain_stmt->set_explain_query_stmt(static_cast<ObDMLStmt *>(child_stmt));
         ParseNode *format = parse_tree.children_[EXPLAIN_FORMAT];
@@ -143,5 +196,73 @@ int ObExplainResolver::resolve(const ParseNode &parse_tree)
     }
   }
 
+  return ret;
+}
+
+int ObExplainResolver::rewrite_file_describe(ObStmt *child_stmt, bool &rewritten)
+{
+  int ret = OB_SUCCESS;
+  rewritten = false;
+  ObSelectStmt *select_stmt = NULL;
+  const TableItem *file_item = NULL;
+  if (OB_ISNULL(child_stmt) || !child_stmt->is_select_stmt()) {
+    // Only DESCRIBE of a file table query is rewritten; other statements keep
+    // the regular EXPLAIN behavior.
+  } else if (OB_ISNULL(select_stmt = static_cast<ObSelectStmt *>(child_stmt))) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (1 != select_stmt->get_table_size()) {
+    // ignore queries with joins
+  } else if (OB_ISNULL(file_item = select_stmt->get_table_item(0)) ||
+             !file_item->is_file_table()) {
+    // not a file table query
+  } else if (OB_ISNULL(file_item->file_table_def_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const ObFileTableDef *table_def = file_item->file_table_def_;
+    ObSqlString sql;
+    if (OB_FAIL(sql.append("select `column_name`, `column_type`, `null`, `key`, "
+                           "`default`, `extra` from ("))) {
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_def->columns_.count(); ++i) {
+      const ObFileColumnDef &col = table_def->columns_.at(i);
+      if (i > 0 && OB_FAIL(sql.append(" union all "))) {
+      } else if (OB_FAIL(sql.append_fmt("select %ld as `ord`, '", static_cast<long>(i)))) {
+      } else if (OB_FAIL(append_sql_literal(sql, col.column_name_))) {
+      } else if (OB_FAIL(sql.append_fmt("' as `column_name`, '%s' as `column_type`, "
+                                        "'%s' as `null`, NULL as `key`, NULL as `default`, "
+                                        "NULL as `extra`",
+                                        file_column_type_name(col.column_type_),
+                                        col.nullable_ ? "YES" : "NO"))) {
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(sql.append(") `file_desc` order by `ord`"))) {
+    } else if (OB_ISNULL(session_info_) || OB_ISNULL(params_.allocator_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ParseResult parse_result;
+      ObParser parser(*params_.allocator_, session_info_->get_sql_mode());
+      if (OB_FAIL(parser.parse(sql.string(), parse_result))) {
+        LOG_WARN("failed to parse generated describe sql", K(sql), K(ret));
+      } else if (OB_ISNULL(parse_result.result_tree_) ||
+                 parse_result.result_tree_->num_child_ < 1 ||
+                 OB_ISNULL(parse_result.result_tree_->children_[0])) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        ObStmt *new_stmt = NULL;
+        ObResolver resolver(params_);
+        if (OB_FAIL(resolver.resolve(ObResolver::IS_NOT_PREPARED_STMT,
+                                     *parse_result.result_tree_->children_[0],
+                                     new_stmt))) {
+          LOG_WARN("failed to resolve generated describe sql", K(ret));
+        } else if (OB_ISNULL(new_stmt)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          stmt_ = new_stmt;
+          rewritten = true;
+        }
+      }
+    }
+  }
   return ret;
 }

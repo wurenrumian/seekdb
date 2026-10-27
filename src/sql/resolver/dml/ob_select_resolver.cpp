@@ -1660,6 +1660,9 @@ int ObSelectResolver::expand_target_list(
   } else if (table_item.is_json_table()) {
     if (OB_FAIL(resolve_all_json_table_columns(table_item, &column_items))) {
     }
+  } else if (table_item.is_file_table()) {
+    if (OB_FAIL(resolve_all_file_table_columns(table_item, column_items))) {
+    }
   } else if (table_item.is_values_table()) {
     if (OB_ISNULL(get_stmt()) || OB_UNLIKELY(get_stmt()->get_column_size() == 0)) {
       ret = OB_ERR_UNEXPECTED;
@@ -3036,6 +3039,20 @@ int ObSelectResolver::resolve_into_outfile_with_format(const ParseNode *node, Ob
       } else if (T_EXTERNAL_FILE_FORMAT_TYPE == option_node->type_
                  || T_CHARSET == option_node->type_) {
       } else if (OB_FAIL(ObResolverUtils::resolve_file_format(option_node, external_format, params_))) {
+      }
+    }
+    if (OB_SUCC(ret)) {
+      // COPY ... (header, nullstr 'NULL') is parsed into the external format.
+      into_item.has_header_ = external_format.csv_format_.parse_header_;
+      if (external_format.csv_format_.null_if_.count() > 0) {
+        into_item.null_string_ = external_format.csv_format_.null_if_.at(0);
+      }
+      if (node->param_num_ > 0) {
+        // DuckDB COPY ... (format csv) writes comma separated values, while
+        // SELECT ... INTO OUTFILE keeps its tab default.
+        external_format.csv_format_.field_term_str_.assign_ptr(",", 1);
+        into_item.field_str_.set_varchar(",", 1);
+        into_item.field_str_.set_collation_type(ObCharset::get_system_collation());
       }
     }
     if (OB_SUCC(ret)

@@ -30,6 +30,7 @@
 #include "sql/optimizer/ob_log_expr_values.h"
 #include "sql/optimizer/ob_log_function_table.h"
 #include "sql/optimizer/ob_log_json_table.h"
+#include "sql/optimizer/ob_log_file_table.h"
 #include "sql/optimizer/ob_log_values.h"
 #include "sql/optimizer/ob_log_subplan_filter.h"
 #include "sql/optimizer/ob_log_subplan_scan.h"
@@ -96,6 +97,7 @@
 #include "sql/engine/basic/ob_select_into_op.h"
 #include "sql/engine/basic/ob_function_table_op.h"
 #include "sql/engine/basic/ob_json_table_op.h"
+#include "sql/engine/basic/ob_file_scan_op.h"
 #include "sql/engine/dml/ob_table_insert_op.h"
 #include "sql/engine/basic/ob_stat_collector_op.h"
 #include "sql/engine/opt_statistics/ob_optimizer_stats_gathering_op.h"
@@ -1737,6 +1739,67 @@ int ObStaticEngineCG::generate_spec(ObLogValuesTableAccess &op,
       } else if (OB_FAIL(mark_expr_self_produced(op.get_output_exprs()))) {
       } else {
         spec.rows_ = table_def->row_cnt_;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStaticEngineCG::generate_spec(ObLogFileTable &op,
+                                    ObFileScanSpec &spec,
+                                    const bool in_root_job)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(in_root_job);
+  const ObDMLStmt *stmt = NULL;
+  const TableItem *table_item = NULL;
+  const ObFileTableDef *table_def = NULL;
+  ObIAllocator &allocator = phy_plan_->get_allocator();
+  if (OB_ISNULL(stmt = op.get_stmt()) ||
+      OB_ISNULL(table_item = stmt->get_table_item_by_id(op.get_table_id())) ||
+      OB_ISNULL(table_def = table_item->file_table_def_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    spec.function_type_ = table_def->function_type_;
+    spec.has_header_ = table_def->has_header_;
+    spec.delimiter_ = static_cast<int64_t>(table_def->delimiter_);
+    spec.quote_ = static_cast<int64_t>(table_def->quote_);
+    spec.escape_ = static_cast<int64_t>(table_def->escape_);
+    spec.file_size_ = table_def->file_size_;
+    spec.file_mtime_ = table_def->file_mtime_;
+    spec.file_ino_ = table_def->file_ino_;
+    spec.table_id_ = table_item->table_id_;
+    if (OB_FAIL(ob_write_string(allocator, table_def->file_path_, spec.file_path_))) {
+    } else if (OB_FAIL(ob_write_string(allocator, table_def->null_string_, spec.null_string_))) {
+    } else if (OB_FAIL(ob_write_string(allocator, table_item->get_table_name(), spec.table_name_))) {
+    } else if (OB_FAIL(spec.column_names_.init(table_def->columns_.count()))) {
+    } else if (OB_FAIL(spec.column_types_.init(table_def->columns_.count()))) {
+    } else if (OB_FAIL(spec.column_nullables_.init(table_def->columns_.count()))) {
+    } else if (OB_FAIL(spec.output_column_indexes_.init(op.get_output_exprs().count()))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < table_def->columns_.count(); ++i) {
+        ObString name;
+        if (OB_FAIL(ob_write_string(allocator, table_def->columns_.at(i).column_name_, name))) {
+        } else if (OB_FAIL(spec.column_names_.push_back(name))) {
+        } else if (OB_FAIL(spec.column_types_.push_back(table_def->columns_.at(i).column_type_))) {
+        } else if (OB_FAIL(spec.column_nullables_.push_back(
+                     table_def->columns_.at(i).nullable_ ? 1 : 0))) {
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(mark_expr_self_produced(op.get_output_exprs()))) {
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < op.get_output_exprs().count(); ++i) {
+        ObRawExpr *raw_expr = op.get_output_exprs().at(i);
+        if (OB_ISNULL(raw_expr) || !raw_expr->is_column_ref_expr()) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          const int64_t column_index = static_cast<ObColumnRefRawExpr *>(raw_expr)->get_column_id()
+                                       - OB_APP_MIN_COLUMN_ID;
+          if (column_index < 0 || column_index >= table_def->columns_.count()) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(spec.output_column_indexes_.push_back(column_index))) {
+          }
+        }
       }
     }
   }
@@ -5460,6 +5523,8 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   } else if (OB_FAIL(spec.external_properties_.store_str(op.get_external_properties()))) {
   } else if (OB_FAIL(spec.user_vars_.init(op.get_user_vars().count()))) {
   } else if (OB_FAIL(spec.select_exprs_.init(op.get_select_exprs().count()))) {
+  } else if (OB_FAIL(spec.column_names_.init(op.get_select_exprs().count()))) {
+  } else if (OB_FAIL(ob_write_string(alloc, op.get_null_string(), spec.null_string_))) {
   } else {
     ObString var;
     for (int64_t i = 0; OB_SUCC(ret) && i < op.get_user_vars().count(); ++i) {
@@ -5486,6 +5551,17 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
       spec.cs_type_ = op.get_cs_type();
       spec.parallel_ = op.get_parallel();
       spec.is_overwrite_ = op.get_is_overwrite();
+      spec.has_header_ = op.get_has_header();
+      // Header names follow the select list aliases.
+      const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt *>(op.get_stmt());
+      if (spec.has_header_ && OB_NOT_NULL(select_stmt)) {
+        for (int64_t i = 0; OB_SUCC(ret) && i < select_stmt->get_select_item_size(); ++i) {
+          ObString name;
+          if (OB_FAIL(ob_write_string(alloc, select_stmt->get_select_item(i).alias_name_, name))) {
+          } else if (OB_FAIL(spec.column_names_.push_back(name))) {
+          }
+        }
+      }
       spec.plan_->need_drive_dml_query_ = true;
     }
   }
@@ -6121,6 +6197,10 @@ int ObStaticEngineCG::get_phy_op_type(ObLogicalOperator &log_op,
     }
     case log_op_def::LOG_JSON_TABLE: {
       type = PHY_JSON_TABLE;
+      break;
+    }
+    case log_op_def::LOG_FILE_TABLE: {
+      type = PHY_FILE_SCAN;
       break;
     }
     case log_op_def::LOG_MONITORING_DUMP: {
