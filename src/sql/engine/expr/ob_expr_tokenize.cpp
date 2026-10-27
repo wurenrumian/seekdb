@@ -17,14 +17,18 @@
 #include "sql/engine/expr/ob_expr_tokenize.h"
 
 #include "lib/alloc/alloc_struct.h"
+#include "lib/allocator/ob_malloc.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "common/json_type/ob_json_base.h"
+#include "common/json_type/ob_json_bin.h"
 #include "common/json_type/ob_json_tree.h"
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/string/ob_string.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "lib/hash/ob_hashutils.h"
+#include "lib/lock/ob_spin_lock.h"
 #include "object/ob_object.h"
 #include "sql/resolver/ddl/ob_fts_index_builder_util.h"
 #include "share/ob_json_access_utils.h"
@@ -39,6 +43,140 @@ namespace oceanbase
 {
 namespace sql
 {
+
+/**
+ * Result cache for TOKENIZE().
+ *
+ * TOKENIZE() is a pure function of its arguments and the dictionaries the parser borrows: an ik
+ * dictionary is loaded once per process (ObDicLoader::is_load_) and never replaced in place, so the
+ * same text always segments into the same tokens. Tokenizing the same text again therefore repeats
+ * work whose answer is already known - a literal repeated in a loop, a generated column recomputed
+ * for the same value, or simply the same statement issued many times.
+ *
+ * The cache keeps the encoded JSON document, not the token list, so a hit skips the segmentation,
+ * the word map, the JSON document build and its serialization. It is direct mapped (one slot per
+ * hash bucket, replaced on collision) so both the lookup and the memory footprint stay bounded: no
+ * allocation happens on a hit beyond the copy into the caller's allocator, and an oversized request
+ * is simply not cached.
+ */
+class FtsTokenizeResultCache
+{
+public:
+  static const int64_t SHARD_CNT = 16;
+  static const int64_t SLOT_CNT_PER_SHARD = 32;
+  static const int64_t MAX_KEY_LEN = 1024;
+  static const int64_t MAX_VALUE_LEN = 8 * 1024;
+  static const int64_t MIN_SLOT_CAPACITY = 512;
+
+  struct Entry
+  {
+    Entry() : hash_(0), key_len_(0), value_len_(0), capacity_(0), buf_(nullptr) {}
+    uint64_t hash_;
+    int64_t key_len_;
+    int64_t value_len_;
+    int64_t capacity_;
+    char *buf_;  // key bytes followed by the value bytes
+  };
+
+  struct Shard
+  {
+    Shard() = default;
+    common::ObSpinLock lock_;
+    Entry slots_[SLOT_CNT_PER_SHARD];
+  };
+
+  static FtsTokenizeResultCache &instance();
+
+  // All failures (including a miss) only leave `hit` false; they never fail the statement.
+  void get(const ObString &key, ObIAllocator &allocator, bool &hit, ObString &value);
+  void put(const ObString &key, const char *value, const int64_t value_len);
+
+private:
+  FtsTokenizeResultCache() = default;
+  Entry &locate(const uint64_t hash, Shard *&shard);
+  DISALLOW_COPY_AND_ASSIGN(FtsTokenizeResultCache);
+
+private:
+  Shard shards_[SHARD_CNT];
+};
+
+FtsTokenizeResultCache &FtsTokenizeResultCache::instance()
+{
+  static FtsTokenizeResultCache cache;
+  return cache;
+}
+
+FtsTokenizeResultCache::Entry &FtsTokenizeResultCache::locate(const uint64_t hash,
+                                                             Shard *&shard)
+{
+  shard = &shards_[hash % SHARD_CNT];
+  return shard->slots_[(hash / SHARD_CNT) % SLOT_CNT_PER_SHARD];
+}
+
+void FtsTokenizeResultCache::get(const ObString &key,
+                                 ObIAllocator &allocator,
+                                 bool &hit,
+                                 ObString &value)
+{
+  hit = false;
+  if (OB_UNLIKELY(key.empty() || key.length() > MAX_KEY_LEN)) {
+    // nothing to do
+  } else {
+    const uint64_t hash = common::murmurhash(key.ptr(), key.length(), 0);
+    Shard *shard = nullptr;
+    Entry &entry = locate(hash, shard);
+    common::ObSpinLockGuard guard(shard->lock_);
+    if (entry.hash_ == hash
+        && entry.key_len_ == key.length()
+        && entry.value_len_ > 0
+        && nullptr != entry.buf_
+        && 0 == MEMCMP(entry.buf_, key.ptr(), key.length())) {
+      char *dst = static_cast<char *>(allocator.alloc(entry.value_len_));
+      if (OB_ISNULL(dst)) {
+        // The caller falls back to tokenizing; a full arena must not fail the statement here.
+      } else {
+        MEMCPY(dst, entry.buf_ + entry.key_len_, entry.value_len_);
+        value.assign_ptr(dst, static_cast<int32_t>(entry.value_len_));
+        hit = true;
+      }
+    }
+  }
+}
+
+void FtsTokenizeResultCache::put(const ObString &key, const char *value, const int64_t value_len)
+{
+  if (OB_UNLIKELY(key.empty() || key.length() > MAX_KEY_LEN || value_len <= 0
+                  || value_len > MAX_VALUE_LEN || OB_ISNULL(value))) {
+    // not worth caching
+  } else {
+    const uint64_t hash = common::murmurhash(key.ptr(), key.length(), 0);
+    Shard *shard = nullptr;
+    Entry &entry = locate(hash, shard);
+    common::ObSpinLockGuard guard(shard->lock_);
+    const int64_t need = key.length() + value_len;
+    if (entry.capacity_ < need) {
+      const int64_t capacity = MAX(need, MIN_SLOT_CAPACITY);
+      char *buf = static_cast<char *>(ob_malloc(capacity, ObMemAttr("FTTokenizeCache")));
+      if (OB_ISNULL(buf)) {
+        // skip caching, the statement has already produced its result
+      } else {
+        if (nullptr != entry.buf_) {
+          ob_free(entry.buf_);
+        }
+        entry.buf_ = buf;
+        entry.capacity_ = capacity;
+      }
+    }
+    if (nullptr != entry.buf_ && entry.capacity_ >= need) {
+      MEMCPY(entry.buf_, key.ptr(), key.length());
+      MEMCPY(entry.buf_ + key.length(), value, value_len);
+      entry.hash_ = hash;
+      entry.key_len_ = key.length();
+      entry.value_len_ = value_len;
+    }
+  }
+}
+
 ObExprTokenize::ObExprTokenize(common::ObIAllocator &alloc)
     : ObStringExprOperator(alloc,
                            T_FUN_TOKENIZE,
@@ -64,15 +202,111 @@ int ObExprTokenize::eval_tokenize(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
   if (OB_UNLIKELY(expr.arg_cnt_ < 1 || expr.arg_cnt_ > 3)) {
     ret = OB_INVALID_ARGUMENT;
   } else if (OB_FAIL(parse_param(expr, ctx, temp_allocator, param))) {
-  } else if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
-  } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
-                                                     ctx,
-                                                     temp_allocator,
-                                                     json_result,
-                                                     expr_datum))) {
+  } else {
+    ObString cache_key;
+    bool cacheable = false;
+    bool cache_hit = false;
+    ObString cache_value;
+    if (OB_FAIL(build_tokenize_cache_key(param, temp_allocator, cache_key, cacheable))) {
+      LOG_WARN("failed to build tokenize cache key", K(ret));
+    } else if (cacheable) {
+      FtsTokenizeResultCache::instance().get(cache_key, temp_allocator, cache_hit, cache_value);
+    }
+    if (OB_SUCC(ret) && cache_hit) {
+      ret = ObJsonExprHelper::pack_json_str_res(expr, ctx, expr_datum, cache_value);
+    } else if (OB_SUCC(ret)) {
+      if (OB_FAIL(tokenize_fulltext(param, param.output_mode_, temp_allocator, json_result))) {
+      } else if (OB_FAIL(ObJsonExprHelper::pack_json_res(expr,
+                                                         ctx,
+                                                         temp_allocator,
+                                                         json_result,
+                                                         expr_datum))) {
+      } else if (cacheable) {
+        cache_tokenize_result(cache_key, json_result, temp_allocator);
+      }
+    }
   }
 
   return ret;
+}
+
+int ObExprTokenize::build_tokenize_cache_key(const TokenizeParam &param,
+                                             ObIAllocator &allocator,
+                                             ObString &key,
+                                             bool &cacheable)
+{
+  int ret = OB_SUCCESS;
+  cacheable = false;
+
+  const int64_t header_len = static_cast<int64_t>(sizeof(int64_t)) * 5;
+  const int64_t parser_len = param.parser_name_.length();
+  const int64_t properties_len = param.properties_.length();
+  const int64_t fulltext_len = param.fulltext_.length();
+  const int64_t key_len = header_len + parser_len + properties_len + fulltext_len;
+
+  if (parser_len < 0 || properties_len < 0 || fulltext_len < 0) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (key_len > FtsTokenizeResultCache::MAX_KEY_LEN) {
+    // A long document is unlikely to repeat and would push the cache footprint up; tokenize it.
+  } else {
+    char *buf = static_cast<char *>(allocator.alloc(key_len));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      int64_t pos = 0;
+      const int64_t mode = static_cast<int64_t>(param.output_mode_);
+      const int64_t collation = static_cast<int64_t>(param.meta_.get_collation_type());
+      MEMCPY(buf + pos, &parser_len, sizeof(int64_t));
+      pos += sizeof(int64_t);
+      MEMCPY(buf + pos, &properties_len, sizeof(int64_t));
+      pos += sizeof(int64_t);
+      MEMCPY(buf + pos, &fulltext_len, sizeof(int64_t));
+      pos += sizeof(int64_t);
+      MEMCPY(buf + pos, &mode, sizeof(int64_t));
+      pos += sizeof(int64_t);
+      MEMCPY(buf + pos, &collation, sizeof(int64_t));
+      pos += sizeof(int64_t);
+      if (parser_len > 0) {
+        MEMCPY(buf + pos, param.parser_name_.ptr(), parser_len);
+        pos += parser_len;
+      }
+      if (properties_len > 0) {
+        MEMCPY(buf + pos, param.properties_.ptr(), properties_len);
+        pos += properties_len;
+      }
+      if (fulltext_len > 0) {
+        MEMCPY(buf + pos, param.fulltext_.ptr(), fulltext_len);
+        pos += fulltext_len;
+      }
+      key.assign_ptr(buf, static_cast<int32_t>(pos));
+      cacheable = true;
+    }
+  }
+  return ret;
+}
+
+void ObExprTokenize::cache_tokenize_result(const ObString &key,
+                                           ObIJsonBase *result,
+                                           ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  bool should_pack_diff = false;
+  ObString raw_binary;
+
+  if (OB_ISNULL(result)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (result->is_bin()
+             && OB_FAIL(static_cast<ObJsonBin *>(result)->should_pack_diff(should_pack_diff))) {
+  } else if (should_pack_diff) {
+    // The packed form differs from the plain binary form, so the encoded bytes are not reusable.
+  } else if (OB_FAIL(share::ObJsonWrapper::get_raw_binary(result, raw_binary, &allocator))) {
+  } else {
+    // Caching is best effort: a failure here must never fail the statement.
+    FtsTokenizeResultCache::instance().put(key, raw_binary.ptr(), raw_binary.length());
+  }
+  if (OB_FAIL(ret)) {
+    LOG_TRACE("skip caching tokenize result", K(ret));
+  }
 }
 
 int ObExprTokenize::tokenize_fulltext(const TokenizeParam &param,

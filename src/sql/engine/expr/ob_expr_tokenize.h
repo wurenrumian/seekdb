@@ -100,6 +100,15 @@ private:
 
   static int construct_ft_parser_inner_name(const ObString &input_str, TokenizeParam &param);
 
+  // Result cache support: the key identifies the tokenize input, the value is the encoded result.
+  static int build_tokenize_cache_key(const TokenizeParam &param,
+                                      common::ObIAllocator &allocator,
+                                      ObString &key,
+                                      bool &cacheable);
+  static void cache_tokenize_result(const ObString &key,
+                                    ObIJsonBase *result,
+                                    common::ObIAllocator &allocator);
+
 private:
   DISALLOW_COPY_AND_ASSIGN(ObExprTokenize);
 };
