@@ -1809,6 +1809,13 @@ public:
   // check if a constant or parameterized constant is NULL.
   static bool is_const_null(ObRawExpr &expr);
   static bool is_full_group_by(ObSelectStmt& stmt, ObSQLMode mode);
+  // need_calc is false only when every reference to match_expr in stmt is a top-level
+  // WHERE conjunct that just tests the score for being non-zero (BOOL(MATCH) or MATCH > 0).
+  static int check_need_calc_match_score(ObExecContext *exec_ctx,
+                                         const ObDMLStmt *stmt,
+                                         ObRawExpr *match_expr,
+                                         bool &need_calc,
+                                         ObIArray<ObExprConstraint> &constraints);
 
   static int check_table_with_fts_or_multivalue_recursively(TableItem *table,
                                                    ObSchemaChecker *schema_checker,

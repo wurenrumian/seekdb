@@ -1114,11 +1114,40 @@ int ObDASIterUtils::create_text_retrieval_tree(ObTableScanParam &scan_param,
     case ObDASOpType::DAS_OP_IR_SCAN:
     case ObDASOpType::DAS_OP_SORT: {
       ObDASCacheLookupIter *lookup_iter = nullptr;
+      ObDASIter *local_lookup_iter = nullptr;
       if (nullptr != ir_scan_ctdef && ir_scan_ctdef->need_calc_relevance()) {
         main_lookup_keep_order = true;
         // TODO: may be optimized to use forward
       }
-      if (table_lookup_ctdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP) {
+      if (ObDASOpType::DAS_OP_TABLE_LOOKUP == table_lookup_ctdef->op_type_) {
+        // The retrieval scan is the rowkey provider itself (the document id is the data table rowkey),
+        // so the back-lookup into the data table is a plain local lookup. The optimizer picks this
+        // shape when the index side has nothing to project, i.e. when the relevance is not needed.
+        int64_t batch_row_count = ObDASLookupIterParam::LOCAL_LOOKUP_ITER_DEFAULT_BATCH_ROW_COUNT;
+        if (scan_param.table_param_->is_fts_index()) {
+          ObEvalCtx *eval_ctx = table_lookup_rtdef->get_lookup_scan_rtdef()->eval_ctx_;
+          batch_row_count = eval_ctx->is_vectorized() ? eval_ctx->max_batch_size_ : 1;
+        }
+        if (OB_FAIL(create_local_lookup_sub_tree(
+            scan_param,
+            alloc,
+            table_lookup_ctdef->get_rowkey_scan_ctdef(),
+            table_lookup_rtdef->get_rowkey_scan_rtdef(),
+            table_lookup_ctdef->get_lookup_scan_ctdef(),
+            table_lookup_rtdef->get_lookup_scan_rtdef(),
+            table_lookup_ctdef,
+            table_lookup_rtdef,
+            related_tablet_ids,
+            trans_desc,
+            snapshot,
+            related_tablet_ids.lookup_tablet_id_,
+            root_iter,
+            local_lookup_iter,
+            batch_row_count))) {
+        } else {
+          root_iter = local_lookup_iter;
+        }
+      } else if (table_lookup_ctdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP) {
         ret = OB_ERR_UNEXPECTED;
       } else if (OB_FAIL(create_cache_lookup_sub_tree(
           scan_param,
@@ -1496,14 +1525,16 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
     if (ir_scan_ctdef->has_pushdown_topk() && !has_duplicate_boolean_tokens) {
       merge_iter_param.topk_mode_ = 1;
       merge_iter_param.daat_mode_ = 1;
-    } else if (merge_iter_param.query_tokens_.count() > OB_MAX_TEXT_RETRIEVAL_TOKEN_CNT
-        || (!is_func_lookup && !ir_scan_ctdef->need_proj_relevance_score())) {
+    } else if (merge_iter_param.query_tokens_.count() > OB_MAX_TEXT_RETRIEVAL_TOKEN_CNT) {
       if (BOOLEAN_MODE == ir_scan_ctdef->mode_flag_) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "Boolean mode with more than 256 tokens is");
       }
       merge_iter_param.taat_mode_ = 1;
     } else {
+      // Only the token count forces the token-at-a-time plan. In particular a query that does not
+      // project the relevance still merges the posting lists document-at-a-time: the TaaT plan
+      // materializes every posting into hash maps, which is far more expensive for large tables.
       merge_iter_param.daat_mode_ = 1;
     }
     if (OB_SUCC(ret) && ir_scan_ctdef->has_pushdown_topk() && has_duplicate_boolean_tokens) {
@@ -1537,7 +1568,8 @@ int ObDASIterUtils::create_text_retrieval_sub_tree(
   }
 
   if (OB_FAIL(ret)) {
-  } else if (size > 0 && !ir_scan_ctdef->need_estimate_total_doc_cnt()) {
+  } else if (size > 0 && ir_scan_ctdef->need_calc_relevance()
+             && !ir_scan_ctdef->need_estimate_total_doc_cnt()) {
     ObDASScanIterParam doc_cnt_agg_param;
     ObDASScanIter *doc_cnt_agg_iter = nullptr;
     init_scan_iter_param(doc_cnt_agg_param, ir_scan_ctdef->get_doc_agg_ctdef(), ir_scan_rtdef);
@@ -1784,8 +1816,10 @@ int ObDASIterUtils::create_domain_lookup_sub_tree(ObTableScanParam &scan_param,
 
   if (OB_ISNULL(table_lookup_ctdef) || OB_ISNULL(table_lookup_rtdef)) {
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_UNLIKELY(table_lookup_ctdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP ||
-                         table_lookup_rtdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP)) {
+  } else if (OB_UNLIKELY((table_lookup_ctdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP
+                          && table_lookup_ctdef->op_type_ != ObDASOpType::DAS_OP_TABLE_LOOKUP)
+                         || (table_lookup_rtdef->op_type_ != ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP
+                             && table_lookup_rtdef->op_type_ != ObDASOpType::DAS_OP_TABLE_LOOKUP))) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_UNLIKELY(table_lookup_ctdef->get_rowkey_scan_ctdef()->op_type_ != ObDASOpType::DAS_OP_IR_AUX_LOOKUP)) {
     ret = OB_ERR_UNEXPECTED;
