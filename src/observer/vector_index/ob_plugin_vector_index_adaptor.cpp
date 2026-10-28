@@ -1829,7 +1829,7 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
             // [AMD-CONTEST] 默认行为：lib=cuvs 索引在 DDL 期间只攒 GPU 缓冲，不建 CPU HNSW
             // （CPU 图只在真正需要回退时才建，见 ob_cuvs_ensure_cpu_index）。
             // OB_CUVS_LEGACY_VSAG=1 可恢复逐行建图，用于 A/B 对照。
-            static const bool skip_vsag_for_cuvs = (nullptr == ::getenv("OB_CUVS_LEGACY_VSAG"));
+            static const bool skip_vsag_for_cuvs = (nullptr != ::getenv("OB_CUVS_SKIP_VSAG"));
             if (skip_vsag_for_cuvs && obvsag::is_marked_cuvs_index(snap_data_->index_)) {
               obvsag::cuvs_buffer_rows(snap_data_->index_, vectors, vids, static_cast<int>(dim), num);
             } else if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, dim, extra_info_buf, num))) {
