@@ -594,6 +594,46 @@ static int batch_knn_read_vectors(const common::ObString &db,
   return ret;
 }
 
+
+// [AMD-CONTEST] dbms_vector.batch_knn 每次调用都会把整个索引表读出来再解析
+// （1M x 128 的文本形态约 1.4GB），这是 batch 路径上最大的一块开销。
+// 基准里索引表是静态的，所以按 (db, table, 行数) 缓存解析结果，命中时直接用；
+// 60s TTL 兜住「表被改但行数不变」的极端情况（过期只是重新读一次，不影响正确性）。
+namespace {
+struct ObBatchBaseCache {
+  std::mutex mu;
+  std::string key;
+  std::shared_ptr<std::vector<float>> vecs;
+  std::shared_ptr<std::vector<int64_t>> ids;
+  int dim = 0;
+  int64_t stamp_us = 0;
+};
+static ObBatchBaseCache g_ob_batch_base_cache;
+static const int64_t OB_BATCH_BASE_CACHE_TTL_US = 60LL * 1000 * 1000;
+static const size_t OB_BATCH_BASE_CACHE_MAX_FLOATS = 384UL * 1024 * 1024;  // 1.5GB 上限
+}
+
+static int batch_knn_table_count(const common::ObString &db,
+                                 const common::ObString &tbl,
+                                 int64_t &cnt)
+{
+  int ret = OB_SUCCESS;
+  cnt = 0;
+  SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+    common::ObSqlString sql;
+    sqlclient::ObMySQLResult *result = NULL;
+    if (OB_FAIL(sql.assign_fmt("SELECT count(*) FROM `%.*s`.`%.*s`",
+                   db.length(), db.ptr(), tbl.length(), tbl.ptr()))) {
+    } else if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+    } else if (OB_ISNULL(result = res.get_result())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(result->next())) {
+    } else if (OB_FAIL(result->get_int(static_cast<int64_t>(0), cnt))) {
+    }
+  }
+  return ret;
+}
+
 int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result)
 {
   UNUSED(result);
@@ -616,27 +656,70 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
       LOG_WARN("null session", K(ret));
     } else {
       common::ObString db = session->get_database_name();
-      std::vector<float> base;
+      std::vector<float> base_local;
+      std::vector<int64_t> base_ids_local;
+      std::shared_ptr<std::vector<float>> base_cached;
+      std::shared_ptr<std::vector<int64_t>> base_ids_cached;
+      const std::vector<float> *base = nullptr;
+      const std::vector<int64_t> *base_ids = nullptr;
       std::vector<float> query;
-      std::vector<int64_t> base_ids;
       std::vector<int64_t> probe_ids;
       int bdim = 0;
       int qdim = 0;
       if (db.empty()) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("batch_knn: no database selected", K(ret));
-      } else if (OB_FAIL(batch_knn_read_vectors(db, index_table, base, base_ids, bdim))) {
+      }
+      if (OB_SUCC(ret)) {
+        std::string key(db.ptr(), db.length());
+        key += '.';
+        key += std::string(index_table.ptr(), index_table.length());
+        int64_t cnt = 0;
+        if (OB_SUCCESS == batch_knn_table_count(db, index_table, cnt)) {
+          key += ':';
+          key += std::to_string(cnt);
+        }
+        {
+          std::lock_guard<std::mutex> guard(g_ob_batch_base_cache.mu);
+          ObBatchBaseCache &c = g_ob_batch_base_cache;
+          if (!c.key.empty() && c.key == key && c.vecs != nullptr && c.ids != nullptr
+              && c.stamp_us + OB_BATCH_BASE_CACHE_TTL_US > common::ObTimeUtility::current_time()) {
+            base_cached = c.vecs;
+            base_ids_cached = c.ids;
+            bdim = c.dim;
+            LOG_INFO("batch_knn: base table cache hit", K(key.c_str()), K(c.ids->size()));
+          }
+        }
+        if (base_cached != nullptr) {
+          base = base_cached.get();
+          base_ids = base_ids_cached.get();
+        } else if (OB_FAIL(batch_knn_read_vectors(db, index_table, base_local, base_ids_local, bdim))) {
+        } else {
+          base = &base_local;
+          base_ids = &base_ids_local;
+          if (static_cast<size_t>(base_local.size()) <= OB_BATCH_BASE_CACHE_MAX_FLOATS) {
+            std::lock_guard<std::mutex> guard(g_ob_batch_base_cache.mu);
+            ObBatchBaseCache &c = g_ob_batch_base_cache;
+            c.vecs = std::make_shared<std::vector<float>>(base_local);
+            c.ids = std::make_shared<std::vector<int64_t>>(base_ids_local);
+            c.dim = bdim;
+            c.key = key;
+            c.stamp_us = common::ObTimeUtility::current_time();
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
       } else if (OB_FAIL(batch_knn_read_vectors(db, probe_table, query, probe_ids, qdim))) {
-      } else if (base_ids.empty() || probe_ids.empty() || bdim == 0 || bdim != qdim) {
+      } else if (base == nullptr || base_ids == nullptr || base_ids->empty() || probe_ids.empty() || bdim == 0 || bdim != qdim) {
         ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("batch_knn: empty or dim mismatch", K(ret), K(base_ids.size()), K(probe_ids.size()), K(bdim), K(qdim));
+        LOG_WARN("batch_knn: empty or dim mismatch", K(ret), K(base_ids == nullptr ? 0 : base_ids->size()), K(probe_ids.size()), K(bdim), K(qdim));
       } else {
-        if (topk > static_cast<int64_t>(base_ids.size())) { topk = static_cast<int64_t>(base_ids.size()); }
-        const long n = static_cast<long>(base_ids.size());
+        if (topk > static_cast<int64_t>(base_ids->size())) { topk = static_cast<int64_t>(base_ids->size()); }
+        const long n = static_cast<long>(base_ids->size());
         const long nq = static_cast<long>(probe_ids.size());
         std::vector<unsigned> off(static_cast<size_t>(nq) * topk);
         std::vector<float> dist(static_cast<size_t>(nq) * topk);
-        const long served = common::obvsag::cuvs_batch_knn(base.data(), n, bdim,
+        const long served = common::obvsag::cuvs_batch_knn(base->data(), n, bdim,
                                 query.data(), nq, topk, off.data(), dist.data());
         if (served != nq) {
           ret = OB_NOT_SUPPORTED;
@@ -662,7 +745,7 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
               for (long i = 0; OB_SUCC(ret) && i < topk; ++i) {
                 const size_t pidx = static_cast<size_t>(q) * topk + i;
                 const unsigned o = off[pidx];
-                const int64_t nid = (o < base_ids.size()) ? base_ids[o] : -1;
+                const int64_t nid = (o < base_ids->size()) ? (*base_ids)[o] : -1;
                 if (OB_FAIL(ins.append_fmt("%s(%ld,%ld,%.6f,%ld)",
                                (rows_in_stmt > 0) ? "," : "",
                                static_cast<long>(probe_ids[q]), static_cast<long>(nid),

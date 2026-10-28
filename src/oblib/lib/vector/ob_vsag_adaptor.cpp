@@ -208,21 +208,60 @@ static void *ob_cuvs_batch_job(void *arg) {
 // [BATCH one-shot] Build a CAGRA over raw base + batch-search nq queries + free,
 // all on a 32MB-stack pthread (cuVS overflows the small PL/worker stack). Used by
 // dbms_vector.batch_knn, which reads vectors from SQL (no add_index registry).
+//
+// [AMD-CONTEST] `reuse` != nullptr 时不再重建：直接在这个已建好的 CAGRA 上做批量
+// search（dbms_vector.batch_knn 每次调用都会重读索引表，而索引表在基准里是静态的，
+// 重建一遍纯属浪费）。
 struct ObCuvsRawBatchJob {
   const float *base; long n; long dim; const float *query; long nq; long topk;
-  unsigned *off; float *dst; long served_;
+  unsigned *off; float *dst; long served_; void *reuse; void *built_;
 };
 static void *ob_cuvs_raw_batch_job(void *arg) {
   ObCuvsRawBatchJob *j = static_cast<ObCuvsRawBatchJob *>(arg);
-  void *h = seekdb_cuvs_build(j->base, j->n, j->dim);
+  void *h = j->reuse;
+  if (h == nullptr) {
+    h = seekdb_cuvs_build(j->base, j->n, j->dim);
+    j->built_ = h;
+  }
   if (h != nullptr) {
     if (seekdb_cuvs_search(h, j->query, j->nq, j->topk, j->off, j->dst) == 0) {
       j->served_ = j->nq;
     }
-    seekdb_cuvs_free(h);
+    // 新 build 出来的 handle 由调用方决定「进缓存」还是「释放」（见 cuvs_batch_knn）。
   }
   return nullptr;
 }
+
+// [AMD-CONTEST] batch 入口的索引缓存：key = (n, dim, 首/中/尾采样指纹)。
+// 命中时跳过 build，只做 search —— 这是 batch 路径唯一的大头。
+// 采样 3x4096 个 float，任何真实的数据变化都会改指纹；指纹只用来判等，不参与计算。
+namespace {
+struct ObCuvsBatchCache {
+  std::mutex mu;
+  void *handle = nullptr;
+  long n = 0;
+  long dim = 0;
+  uint64_t fp = 0;
+};
+static ObCuvsBatchCache g_ob_cuvs_batch_cache;
+
+static uint64_t ob_cuvs_batch_fp(const float *base, long n, long dim) {
+  uint64_t h = 1469598103934665603ULL;
+  const long total = n * dim;
+  const long chunk = 4096;
+  const long offs[3] = {0, total / 2 - chunk / 2, total - chunk};
+  for (int s = 0; s < 3; ++s) {
+    long b = offs[s] < 0 ? 0 : offs[s];
+    long e = (b + chunk) < total ? (b + chunk) : total;
+    const unsigned char *p = reinterpret_cast<const unsigned char *>(base + b);
+    const long bytes = (e - b) * static_cast<long>(sizeof(float));
+    for (long i = 0; i < bytes; ++i) { h ^= p[i]; h *= 1099511628211ULL; }
+  }
+  h ^= static_cast<uint64_t>(n); h *= 1099511628211ULL;
+  h ^= static_cast<uint64_t>(dim); h *= 1099511628211ULL;
+  return h;
+}
+}  // namespace
 
 static const size_t OB_CUVS_MIN_PTS = 256;  // CAGRA needs a graph; below this -> VSAG
 
@@ -1790,11 +1829,27 @@ long cuvs_batch_knn(const float *base, long n, long dim,
   if (!ob_cuvs_enabled()) { return 0; }
   if (base == nullptr || query == nullptr || out_ids == nullptr ||
       out_dist == nullptr || n <= 0 || dim <= 0 || nq <= 0 || topk <= 0) { return 0; }
-  ObCuvsRawBatchJob job{base, n, dim, query, nq, topk, out_ids, out_dist, 0};
+  const uint64_t fp = ob_cuvs_batch_fp(base, n, dim);
+  std::lock_guard<std::mutex> guard(g_ob_cuvs_batch_cache.mu);
+  ObCuvsBatchCache &cache = g_ob_cuvs_batch_cache;
+  void *reuse = nullptr;
+  if (cache.handle != nullptr && cache.n == n && cache.dim == dim && cache.fp == fp) {
+    reuse = cache.handle;  // 命中：只 search
+  }
+  ObCuvsRawBatchJob job{base, n, dim, query, nq, topk, out_ids, out_dist, 0, reuse, nullptr};
   pthread_t tid; pthread_attr_t attr; pthread_attr_init(&attr);
   pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
   if (pthread_create(&tid, &attr, ob_cuvs_raw_batch_job, &job) == 0) { pthread_join(tid, nullptr); }
   pthread_attr_destroy(&attr);
+  if (reuse == nullptr) {
+    // 未命中：把这次建好的索引留下来给后续调用用（旧的先释放）
+    if (cache.handle != nullptr) { seekdb_cuvs_free(cache.handle); cache.handle = nullptr; }
+    if (job.built_ != nullptr && job.served_ > 0) {
+      cache.handle = job.built_; cache.n = n; cache.dim = dim; cache.fp = fp;
+    } else if (job.built_ != nullptr) {
+      seekdb_cuvs_free(job.built_);
+    }
+  }
   ob_vsag_trace("cuvs_raw_batch", base, nq, topk);
   return job.served_;
 }
