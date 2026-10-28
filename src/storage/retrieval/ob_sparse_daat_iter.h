@@ -40,11 +40,46 @@ struct ObSRMergeItem
 
 struct ObSRMergeCmp
 {
+  enum CmpMode
+  {
+    GENERIC_CMP = 0,
+    BINARY_CMP = 1,
+  };
+
   ObSRMergeCmp();
   virtual ~ObSRMergeCmp() {}
 
   int init(sql::ObDatumMeta id_meta, const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids);
-  int cmp(const ObSRMergeItem &l, const ObSRMergeItem &r, int64_t &cmp_ret);
+  // A domain id of a fulltext index is stored as a binary string. Comparing two of them through the
+  // generic datum comparison costs a collation validity check, a charset lookup and an indirect call
+  // per duel, so do the plain byte comparison that BINARY collation is defined as when possible.
+  OB_INLINE int cmp(const ObSRMergeItem &l, const ObSRMergeItem &r, int64_t &cmp_ret)
+  {
+    int ret = OB_SUCCESS;
+    if (IS_NOT_INIT) {
+      ret = OB_NOT_INIT;
+    } else {
+      const ObDatum &l_datum = get_id_datum(l.iter_idx_);
+      const ObDatum &r_datum = get_id_datum(r.iter_idx_);
+      int tmp_ret = 0;
+      if (OB_UNLIKELY(l_datum.is_null()) || OB_UNLIKELY(r_datum.is_null())) {
+        // a domain id is never null, keep the generic comparison for that (unexpected) case
+        if (OB_FAIL(cmp_func_(l_datum, r_datum, tmp_ret, nullptr))) {
+        }
+      } else if (OB_LIKELY(BINARY_CMP == cmp_mode_)) {
+        const int64_t l_len = l_datum.len_;
+        const int64_t r_len = r_datum.len_;
+        const int64_t cmp_len = MIN(l_len, r_len);
+        const int cmp_res = cmp_len > 0 ? MEMCMP(l_datum.ptr_, r_datum.ptr_, cmp_len) : 0;
+        tmp_ret = 0 != cmp_res ? cmp_res : static_cast<int>(l_len - r_len);
+      } else if (OB_FAIL(cmp_func_(l_datum, r_datum, tmp_ret, nullptr))) {
+      }
+      if (OB_SUCC(ret)) {
+        cmp_ret = tmp_ret;
+      }
+    }
+    return ret;
+  }
 private:
   inline const ObDatum &get_id_datum(const int64_t iter_idx)
   {
@@ -57,6 +92,7 @@ private:
   // TODO: if memory lifetime of docid datum is guaranteed by dim_iters, we can use pointer to datum directly
   //       and avoid deep copy into merge heap here
   const ObFixedArray<const ObDatum *, ObIAllocator> *iter_ids_;
+  CmpMode cmp_mode_;
   bool is_inited_;
 };
 

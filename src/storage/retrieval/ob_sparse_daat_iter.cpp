@@ -26,6 +26,7 @@ namespace storage
 ObSRMergeCmp::ObSRMergeCmp()
   : cmp_func_(nullptr),
     iter_ids_(nullptr),
+    cmp_mode_(GENERIC_CMP),
     is_inited_(false)
 {
 }
@@ -44,26 +45,8 @@ int ObSRMergeCmp::init(
     if (OB_ISNULL(cmp_func_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
+      cmp_mode_ = common::CS_TYPE_BINARY == id_meta.cs_type_ ? BINARY_CMP : GENERIC_CMP;
       is_inited_ = true;
-    }
-  }
-  return ret;
-}
-
-int ObSRMergeCmp::cmp(
-    const ObSRMergeItem &l,
-    const ObSRMergeItem &r,
-    int64_t &cmp_ret)
-{
-  int ret = OB_SUCCESS;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-  } else {
-    int tmp_ret = 0;
-    if (OB_FAIL(cmp_func_(
-            get_id_datum(l.iter_idx_), get_id_datum(r.iter_idx_), tmp_ret, nullptr))) {
-    } else {
-      cmp_ret = tmp_ret;
     }
   }
   return ret;
