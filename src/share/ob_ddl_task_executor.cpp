@@ -15,6 +15,7 @@
  */
 
 #include "ob_ddl_task_executor.h"
+#include "lib/cpu/ob_cpu_topology.h"
 #include "lib/ob_running_mode.h"
 #include "lib/thread/ob_thread_name.h"
 #include "lib/stat/ob_diagnostic_info_guard.h"
@@ -350,7 +351,20 @@ int ObDDLLocalBuilder::push_task(ObAsyncTask &task)
 
 int64_t ObDDLLocalBuilder::get_thread_cnt_() const
 {
-  return lib::is_mini_mode() ? 1 : 16;
+  // One fulltext index is built by several independent auxiliary index builds (the inverted index,
+  // the doc-word table, ...). Serially they leave the machine idle: each one runs a single worker,
+  // so a two-index DDL spends most of its time waiting on one build at a time. A mini mode server
+  // used to get exactly one builder thread, which serialized all of them.
+  // Run a bounded number of builds at once instead, keeping two cores' worth of headroom.
+  const int64_t reserverd_cpu = 2;
+  const int64_t max_builder_cnt = 4;
+  int64_t builder_cnt = max_builder_cnt;
+  if (lib::is_mini_mode()) {
+    builder_cnt = MIN(max_builder_cnt, MAX(common::get_cpu_count() - reserverd_cpu, 1));
+  } else {
+    builder_cnt = 16;
+  }
+  return builder_cnt;
 }
 
 }  // end namespace share
