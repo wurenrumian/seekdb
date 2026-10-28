@@ -508,12 +508,19 @@ int ObTextRetrievalDaaTTokenIter::save_relevances_and_docids()
   } else if (OB_FAIL(relevance_expr_->eval_batch(*eval_ctx_, *token_iter_->get_skip(), count_))) {
   } else {
     cur_idx_ = 0;
-    const ObDatumVector &relevance_datum = relevance_expr_->locate_expr_datumvector(*eval_ctx_);
-    const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+    // Walk the batch datum arrays directly: ObDatumVector::at() re-applies the batch mask and
+    // ObFixedArray::operator[] re-checks the bound on every row, neither of which can change here.
+    const ObDatum *relevance_datums =
+        relevance_expr_->locate_expr_datumvector(*eval_ctx_).datums_;
+    const ObDatum *doc_id_datums =
+        inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_).datums_;
+    ObDocIdExt *doc_ids = doc_id_.get_data();
+    double *relevances = relevance_.get_data();
+    const sql::ObBitVector *skip = token_iter_->get_skip();
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
-      if (OB_LIKELY(!token_iter_->get_skip()->at(i))) {
-        relevance_[i] = relevance_datum.at(i)->get_double();
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
+      if (OB_LIKELY(nullptr == skip || !skip->at(i))) {
+        relevances[i] = relevance_datums[i].get_double();
+        if (OB_FAIL(doc_ids[i].from_datum(doc_id_datums[i]))) {
         }
       }
     }
@@ -528,13 +535,15 @@ int ObTextRetrievalDaaTTokenIter::save_docids()
     ret = OB_INVALID_ARGUMENT;
   } else {
     cur_idx_ = 0;
-    const ObDatumVector &doc_id_datum = inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_);
+    const ObDatum *doc_id_datums =
+        inv_scan_domain_id_col_->locate_expr_datumvector(*eval_ctx_).datums_;
+    ObDocIdExt *doc_ids = doc_id_.get_data();
     // The skip bitmap is only allocated when the relevance is calculated.
     const sql::ObBitVector *skip = token_iter_->get_skip();
     for (int64_t i = 0; OB_SUCC(ret) && i < count_; ++i) {
       if (OB_LIKELY(nullptr == skip || !skip->at(i))) {
-        if (OB_FAIL(doc_id_[i].from_datum(*doc_id_datum.at(i)))) {
-        };
+        if (OB_FAIL(doc_ids[i].from_datum(doc_id_datums[i]))) {
+        }
       }
     }
   }
@@ -558,7 +567,7 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
   while (OB_SUCC(ret) && !find) {
     if (cur_idx_ < count_) {
       if (OB_FAIL(cmp_func_(
-              id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
+              id_datum, doc_id_.get_data()[cur_idx_].get_datum(), result, nullptr))) {
       } else if (result <= 0) {
         find = true;
       } else {
@@ -573,7 +582,7 @@ int ObTextRetrievalDaaTTokenIter::advance_to(const ObDatum &id_datum)
     } else if (cur_idx_ != 0) {
       ret = OB_ERR_UNEXPECTED;
     } else if (OB_FAIL(cmp_func_(
-                   id_datum, doc_id_[cur_idx_].get_datum(), result, nullptr))) {
+                   id_datum, doc_id_.get_data()[cur_idx_].get_datum(), result, nullptr))) {
     } else if (result <= 0) {
       find = true;
     } else {
@@ -589,7 +598,7 @@ int ObTextRetrievalDaaTTokenIter::get_curr_score(double &score) const
   if (OB_UNLIKELY(cur_idx_ >= count_)) {
     ret = OB_ARRAY_OUT_OF_RANGE;
   } else if (relevance_expr_) {
-    score = relevance_[cur_idx_];
+    score = relevance_.get_data()[cur_idx_];
   }
   return ret;
 }
@@ -600,7 +609,8 @@ int ObTextRetrievalDaaTTokenIter::get_curr_id(const ObDatum *&id_datum) const
   if (OB_UNLIKELY(cur_idx_ >= count_)) {
     ret = OB_ARRAY_OUT_OF_RANGE;
   } else {
-    id_datum = &doc_id_[cur_idx_].get_datum();
+    // hot path in the merge: cur_idx_ is kept in [0, count_) by get_next_row()/advance_to()
+    id_datum = &doc_id_.get_data()[cur_idx_].get_datum();
   }
   return ret;
 }
