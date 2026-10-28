@@ -397,37 +397,43 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
   ObExpr *relevance_proj_expr = iter_param_->relevance_proj_expr_;
   ObExpr *id_proj_expr = iter_param_->id_proj_expr_;
   ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
-  ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+  const ObDocIdExt *domain_ids = buffered_domain_ids_.get_data();
+  const double *relevances = buffered_relevances_.get_data();
 
   if (eval_ctx->is_vectorized()) {
+    // Locate the whole batch of output datums once instead of going through
+    // locate_datum_for_write() (which re-reads the batch index) for every row,
+    // and mark the expressions evaluated once - the flags are per expression,
+    // not per row.
     sql::ObBitVector &id_evaluated_flags = id_proj_expr->get_evaluated_flags(*eval_ctx);
+    ObDatum *id_proj_datums = id_proj_expr->locate_datums_for_update(*eval_ctx, count);
     for (int64_t i = 0; i < count; ++i) {
-      guard.set_batch_idx(i);
-      ObDatum &id_proj_datum = id_proj_expr->locate_datum_for_write(*eval_ctx);
-      set_datum_func_(id_proj_datum, buffered_domain_ids_.get_data()[i]);
+      set_datum_func_(id_proj_datums[i], domain_ids[i]);
       id_evaluated_flags.set(i);
-      id_proj_expr->set_evaluated_projected(*eval_ctx);
     }
+    id_proj_expr->set_evaluated_projected(*eval_ctx);
     if (iter_param_->need_project_relevance()) {
       sql::ObBitVector &relevance_evaluated_flags = relevance_proj_expr->get_evaluated_flags(*eval_ctx);
+      ObDatum *relevance_proj_datums = relevance_proj_expr->locate_datums_for_update(*eval_ctx, count);
       for (int64_t i = 0; i < count; ++i) {
-        guard.set_batch_idx(i);
-        ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
-        relevance_proj_datum.set_double(buffered_relevances_.get_data()[i]);
+        relevance_proj_datums[i].set_double(relevances[i]);
         relevance_evaluated_flags.set(i);
-        relevance_proj_expr->set_evaluated_projected(*eval_ctx);
       }
+      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
     }
   } else if (OB_UNLIKELY(1 != count)) {
     ret = OB_ERR_UNEXPECTED;
   } else {
+    ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
     guard.set_batch_idx(0);
     ObDatum &id_proj_datum = id_proj_expr->locate_datum_for_write(*eval_ctx);
-    set_datum_func_(id_proj_datum, buffered_domain_ids_.get_data()[0]);
+    set_datum_func_(id_proj_datum, domain_ids[0]);
     id_proj_expr->set_evaluated_projected(*eval_ctx);
-    ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
-    relevance_proj_datum.set_double(buffered_relevances_.get_data()[0]);
-    relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    if (iter_param_->need_project_relevance()) {
+      ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
+      relevance_proj_datum.set_double(relevances[0]);
+      relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    }
   }
   return ret;
 }
