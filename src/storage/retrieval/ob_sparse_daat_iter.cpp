@@ -65,6 +65,8 @@ ObSRDaaTIterImpl::ObSRDaaTIterImpl()
     buffered_relevances_(),
     next_round_iter_idxes_(),
     next_round_cnt_(0),
+    counted_row_cnt_(0),
+    count_result_produced_(false),
     set_datum_func_(nullptr)
 {
 }
@@ -141,6 +143,8 @@ void ObSRDaaTIterImpl::reset()
   next_round_cnt_ = 0;
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
+  counted_row_cnt_ = 0;
+  count_result_produced_ = false;
   is_inited_ = false;
 }
 
@@ -161,6 +165,8 @@ void ObSRDaaTIterImpl::reuse(const bool switch_tablet)
   }
   input_row_cnt_ = 0;
   output_row_cnt_ = 0;
+  counted_row_cnt_ = 0;
+  count_result_produced_ = false;
 }
 
   int ObSRDaaTIterImpl::get_query_max_score(double &score)
@@ -207,6 +213,9 @@ int ObSRDaaTIterImpl::get_next_rows(const int64_t capacity, int64_t &count)
     ret = OB_ITER_END;
   } else if (iter_param_->limit_param_->is_valid() && output_row_cnt_ >= iter_param_->limit_param_->limit_) {
     ret = OB_ITER_END;
+  } else if (iter_param_->need_count()) {
+    if (OB_FAIL(get_count_result(count))) {
+    }
   } else if (OB_FAIL(pre_process())) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
     } else {
@@ -371,6 +380,13 @@ int ObSRDaaTIterImpl::cache_result(int64_t &count, const ObDatum &id_datum, cons
 {
   int ret = OB_SUCCESS;
   const common::ObLimitParam *limit_param= iter_param_->limit_param_;
+  if (iter_param_->need_count()) {
+    // The only thing a count-only query observes is how many documents matched, so the merged row
+    // does not have to be copied out: account for it and let the next round advance the merge.
+    ++counted_row_cnt_;
+    ++output_row_cnt_;
+    return ret;
+  }
   const int64_t limit = limit_param->limit_;
   const int64_t offset = limit_param->offset_;
   ++input_row_cnt_;
@@ -433,6 +449,50 @@ int ObSRDaaTIterImpl::project_results(const int64_t count)
       ObDatum &relevance_proj_datum = relevance_proj_expr->locate_datum_for_write(*eval_ctx);
       relevance_proj_datum.set_double(relevances[0]);
       relevance_proj_expr->set_evaluated_projected(*eval_ctx);
+    }
+  }
+  return ret;
+}
+
+int ObSRDaaTIterImpl::get_count_result(int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  if (count_result_produced_) {
+    ret = OB_ITER_END;
+  } else if (OB_FAIL(pre_process())) {
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+    } else {
+      // no dimension iterator produced a posting at all: the answer is zero
+      ret = OB_SUCCESS;
+      counted_row_cnt_ = 0;
+    }
+  }
+  while (OB_SUCC(ret) && !count_result_produced_) {
+    int64_t ignored = 0;
+    if (OB_FAIL(do_one_merge_round(ignored))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+      } else {
+        ret = OB_SUCCESS;
+        count_result_produced_ = true;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObExpr *count_expr = iter_param_->count_proj_expr_;
+    ObEvalCtx *eval_ctx = iter_param_->eval_ctx_;
+    if (OB_ISNULL(count_expr) || OB_ISNULL(eval_ctx)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx);
+      guard.set_batch_idx(0);
+      ObDatum &count_datum = count_expr->locate_datum_for_write(*eval_ctx);
+      count_datum.set_int(counted_row_cnt_);
+      if (eval_ctx->is_vectorized()) {
+        count_expr->get_evaluated_flags(*eval_ctx).set(0);
+      }
+      count_expr->set_evaluated_projected(*eval_ctx);
+      count = 1;
     }
   }
   return ret;

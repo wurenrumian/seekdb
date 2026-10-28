@@ -83,8 +83,12 @@ public:
       avg_doc_len_est_spec_(alloc),
       mode_flag_(NATURAL_LANGUAGE_MODE),
       flags_(0),
-      field_boost_expr_(nullptr) {}
+      field_boost_expr_(nullptr),
+      count_agg_expr_(nullptr) {}
   bool need_calc_relevance() const { return nullptr != relevance_expr_; }
+  // A count-only query pushes its COUNT(*) into this scan: the iterator then only reports how many
+  // documents matched instead of producing one row per document.
+  bool is_count_only() const { return nullptr != count_agg_expr_; }
   bool need_proj_relevance_score() const { return nullptr != relevance_proj_col_; }
   bool need_inv_idx_agg() const { return has_inv_agg_ && need_calc_relevance(); }
   bool need_block_max_scan() const { return has_block_max_scan_; }
@@ -165,7 +169,8 @@ public:
                        K_(token_col),
                        K_(block_max_spec),
                        K_(mode_flag),
-                       KPC_(field_boost_expr));
+                       KPC_(field_boost_expr),
+                       KPC_(count_agg_expr));
 
   ObExpr *search_text_;
   ObExpr *inv_scan_domain_id_col_;
@@ -195,6 +200,7 @@ public:
     };
   };
   ObExpr *field_boost_expr_;
+  ObExpr *count_agg_expr_; // non-null when the aggregation above this scan is a pushed down COUNT(*)
 };
 
 struct ObDASIRScanRtDef : ObDASAttachRtDef

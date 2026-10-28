@@ -128,6 +128,7 @@ protected:
   virtual int filter_on_demand(const int64_t count, const double relevance, bool &need_project);
   virtual int cache_result(int64_t &count, const ObDatum &id_datum, const double relevance);
   virtual int project_results(const int64_t count);
+  int get_count_result(int64_t &count);
   int init_merge_heap(const int64_t count);
 protected:
   ObIAllocator *iter_allocator_;
@@ -141,6 +142,9 @@ protected:
   ObFixedArray<double, ObIAllocator> buffered_relevances_;
   ObFixedArray<int64_t, ObIAllocator> next_round_iter_idxes_;
   int64_t next_round_cnt_;
+  // count-only mode: the merge still runs, but its output is only the number of matched documents
+  int64_t counted_row_cnt_;
+  bool count_result_produced_;
   void (*set_datum_func_)(ObDatum &, const ObDocIdExt &);
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSRDaaTIterImpl);

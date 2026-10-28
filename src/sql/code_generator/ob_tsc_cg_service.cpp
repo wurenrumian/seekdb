@@ -1894,7 +1894,8 @@ int ObTscCgService::generate_text_ir_ctdef(const ObLogTableScan &op,
 
   if (OB_SUCC(ret)) {
     root_ctdef = ir_scan_ctdef;
-    if (OB_FAIL(generate_text_ir_spec_exprs(tr_info, *ir_scan_ctdef))) {
+    if (OB_FAIL(generate_text_ir_count_expr(op, *ir_scan_ctdef))) {
+    } else if (OB_FAIL(generate_text_ir_spec_exprs(tr_info, *ir_scan_ctdef))) {
     } else {
       const ObCostTableScanInfo *est_cost_info = op.get_est_cost_info();
       int partition_row_cnt = 0;
@@ -3083,9 +3084,46 @@ int ObTscCgService::generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_in
     }
   }
 
+  if (OB_SUCC(ret) && nullptr != text_ir_scan_ctdef.count_agg_expr_) {
+    if (OB_FAIL(result_output.push_back(text_ir_scan_ctdef.count_agg_expr_))) {
+    }
+  }
+
   if (FAILEDx(text_ir_scan_ctdef.result_output_.assign(result_output))) {
   }
 
+  return ret;
+}
+
+// A pushed down COUNT(*) is the only thing this scan is asked to produce: the iterator counts the
+// merged documents and writes the total into this expression, so nothing else has to materialize the
+// matched rows. It has to be part of the scan's result output as well, which is what a remote task
+// transmits back to the aggregation above.
+int ObTscCgService::generate_text_ir_count_expr(const ObLogTableScan &op,
+                                                ObDASIRScanCtDef &text_ir_scan_ctdef)
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<ObAggFunRawExpr *> &pushdown_aggr_exprs = op.get_pushdown_aggr_exprs();
+  if (pushdown_aggr_exprs.empty()) {
+    // a normal (non count-only) text retrieval scan
+  } else if (OB_UNLIKELY(1 != pushdown_aggr_exprs.count())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected pushdown aggregation count for text retrieval scan", K(ret),
+             K(pushdown_aggr_exprs.count()));
+  } else {
+    ObAggFunRawExpr *aggr_expr = pushdown_aggr_exprs.at(0);
+    ObExpr *count_expr = nullptr;
+    if (OB_ISNULL(aggr_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(cg_.generate_rt_expr(*aggr_expr, count_expr))) {
+    } else if (OB_ISNULL(count_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(cg_.mark_expr_self_produced(aggr_expr))) {
+    } else {
+      // generate_text_ir_spec_exprs() puts it into result_output_, which is sized exactly once
+      text_ir_scan_ctdef.count_agg_expr_ = count_expr;
+    }
+  }
   return ret;
 }
 

@@ -4564,6 +4564,29 @@ int ObLogPlan::create_scala_group_plan(const ObIArray<ObAggFunRawExpr*> &aggr_it
   return ret;
 }
 
+// A fulltext scan can only count for the aggregation: the only value the query can observe is the
+// number of matched rows, so the scan does not have to produce them. Everything that needs the rows
+// themselves (relevance, a filter the scan cannot apply, an index merge, group by) keeps the scan out.
+static bool can_count_in_text_retrieval_scan(const ObLogTableScan *scan_op,
+                                             const ObIArray<ObAggFunRawExpr *> &aggr_items,
+                                             const ObIArray<ObRawExpr*> &groupby_columns)
+{
+  bool can = false;
+  if (nullptr == scan_op || !scan_op->is_text_retrieval_scan()) {
+  } else if (scan_op->use_index_merge() || scan_op->need_text_retrieval_calc_relevance()) {
+    // an index merge has more than one scan to merge, and a scored query needs the rows
+  } else if (scan_op->get_text_retrieval_info().need_sort()) {
+    // a limit pushed into the scan bounds the rows the scan reports, so the scan cannot count
+  } else if (!groupby_columns.empty() || 1 != aggr_items.count()) {
+  } else {
+    const ObAggFunRawExpr *aggr_expr = aggr_items.at(0);
+    can = nullptr != aggr_expr
+          && T_FUN_COUNT == aggr_expr->get_expr_type()
+          && !aggr_expr->is_param_distinct();
+  }
+  return can;
+}
+
 int ObLogPlan::try_push_aggr_into_table_scan(ObLogicalOperator *top,
                                              const ObIArray<ObAggFunRawExpr *> &aggr_items,
                                              const ObIArray<ObRawExpr*> &groupby_columns)
@@ -4580,7 +4603,8 @@ int ObLogPlan::try_push_aggr_into_table_scan(ObLogicalOperator *top,
     } else if (is_get ||
                has_npd_filter ||
                scan_op->get_index_back() ||
-               scan_op->is_text_retrieval_scan() ||
+               (scan_op->is_text_retrieval_scan() &&
+                !can_count_in_text_retrieval_scan(scan_op, aggr_items, groupby_columns)) ||
                scan_op->is_sample_scan() ||
                (scan_op->is_index_scan() && !groupby_columns.empty()) ||
                (is_descending_direction(scan_op->get_scan_direction()) && !groupby_columns.empty())) {

@@ -209,6 +209,7 @@ private:
                                            ObDASScanCtDef &scan_ctdef);
   int generate_text_ir_spec_exprs(const ObTextRetrievalInfo &tr_info,
                                   ObDASIRScanCtDef &text_ir_scan_ctdef);
+  int generate_text_ir_count_expr(const ObLogTableScan &op, ObDASIRScanCtDef &text_ir_scan_ctdef);
   int check_skip_index_validity(const ObTextRetrievalInfo &tr_info, bool &is_valid) const;
   int generate_text_block_max_scan_ctdef(const ObTextRetrievalInfo &tr_info,
                                          ObDASIRScanCtDef &text_ir_scan_ctdef);
