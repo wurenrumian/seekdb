@@ -613,6 +613,51 @@ static const int64_t OB_BATCH_BASE_CACHE_TTL_US = 60LL * 1000 * 1000;
 static const size_t OB_BATCH_BASE_CACHE_MAX_FLOATS = 384UL * 1024 * 1024;  // 1.5GB 上限
 }
 
+// [AMD-CONTEST] 采样指纹：取索引表首/尾各 4 行的原始字节做 hash，用于判断缓存是否可用。
+// 只多两次「读 4 行」的极小查询，却能防止「表名和行数相同但内容被换掉」时的脏命中。
+static int batch_knn_sample_rows(const common::ObString &db,
+                                  const common::ObString &tbl,
+                                  bool desc,
+                                  common::ObArenaAllocator &alloc,
+                                  uint64_t &h)
+{
+  int ret = OB_SUCCESS;
+  h = 1469598103934665603ULL;
+  SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+    common::ObSqlString sql;
+    sqlclient::ObMySQLResult *result = NULL;
+    if (OB_FAIL(sql.assign_fmt("SELECT * FROM `%.*s`.`%.*s` ORDER BY 1 %s LIMIT 4",
+                   db.length(), db.ptr(), tbl.length(), tbl.ptr(), desc ? "DESC" : "ASC"))) {
+    } else if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+    } else if (OB_ISNULL(result = res.get_result())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      int64_t rows = 0;
+      while (OB_SUCC(ret) && OB_SUCC(result->next())) {
+        ++rows;
+        for (int64_t c = 0; OB_SUCC(ret) && c < 2; ++c) {
+          ObObj obj;
+          if (OB_FAIL(result->get_obj(c, obj))) {
+          } else if (obj.is_varchar_or_char()) {
+            const common::ObString vs = obj.get_string();
+            for (int64_t i = 0; i < vs.length(); ++i) {
+              h ^= static_cast<unsigned char>(vs.ptr()[i]);
+              h *= 1099511628211ULL;
+            }
+          } else if (obj.is_int()) {
+            h ^= static_cast<uint64_t>(obj.get_int());
+            h *= 1099511628211ULL;
+          }
+        }
+      }
+      if (OB_ITER_END == ret) { ret = OB_SUCCESS; }
+      if (OB_SUCC(ret) && 0 == rows) { h = 0; }
+    }
+  }
+  alloc.reuse();
+  return ret;
+}
+
 static int batch_knn_table_count(const common::ObString &db,
                                  const common::ObString &tbl,
                                  int64_t &cnt)
@@ -678,11 +723,25 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
         if (OB_SUCCESS == batch_knn_table_count(db, index_table, cnt)) {
           key += ':';
           key += std::to_string(cnt);
+          common::ObArenaAllocator sample_alloc("VecBatchSample");
+          uint64_t head = 0;
+          uint64_t tail = 0;
+          if (OB_SUCCESS == batch_knn_sample_rows(db, index_table, false, sample_alloc, head)
+              && OB_SUCCESS == batch_knn_sample_rows(db, index_table, true, sample_alloc, tail)) {
+            key += ':';
+            key += std::to_string(head);
+            key += ':';
+            key += std::to_string(tail);
+          } else {
+            key.clear();  // 拿不到指纹就不进缓存
+          }
+        } else {
+          key.clear();
         }
         {
           std::lock_guard<std::mutex> guard(g_ob_batch_base_cache.mu);
           ObBatchBaseCache &c = g_ob_batch_base_cache;
-          if (!c.key.empty() && c.key == key && c.vecs != nullptr && c.ids != nullptr
+          if (!key.empty() && !c.key.empty() && c.key == key && c.vecs != nullptr && c.ids != nullptr
               && c.stamp_us + OB_BATCH_BASE_CACHE_TTL_US > common::ObTimeUtility::current_time()) {
             base_cached = c.vecs;
             base_ids_cached = c.ids;
@@ -697,7 +756,7 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
         } else {
           base = &base_local;
           base_ids = &base_ids_local;
-          if (static_cast<size_t>(base_local.size()) <= OB_BATCH_BASE_CACHE_MAX_FLOATS) {
+          if (!key.empty() && static_cast<size_t>(base_local.size()) <= OB_BATCH_BASE_CACHE_MAX_FLOATS) {
             std::lock_guard<std::mutex> guard(g_ob_batch_base_cache.mu);
             ObBatchBaseCache &c = g_ob_batch_base_cache;
             c.vecs = std::make_shared<std::vector<float>>(base_local);

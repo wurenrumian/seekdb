@@ -3301,11 +3301,90 @@ int ObPluginVectorIndexAdaptor::prepare_delta_mem_data(roaring::api::roaring64_b
   return ret;
 }
 
+// [AMD-CONTEST] 该索引是不是声明成 lib=cuvs。
+bool ObPluginVectorIndexAdaptor::is_cuvs_index()
+{
+  ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data_);
+  return param != nullptr && param->lib_ == ObVectorIndexAlgorithmLib::VIAL_CUVS;
+}
+
+// [AMD-CONTEST] lib=cuvs 索引的 GPU 缓冲负载（magic|dim|n|ids|vectors）反序列化：
+// 直接把行恢复进 cuVS 缓冲并重新标记，首查询会重建 CAGRA，CPU 回退路径按需建图。
+int ObPluginVectorIndexAdaptor::deserialize_cuvs_buffer(ObHNSWDeserializeCallback::CbParam &param,
+                                                        ObIStreamBuf::Callback &cb)
+{
+  int ret = OB_SUCCESS;
+  {
+    // 和 ObVectorIndexSerializer::deserialize 一样：先用 (nullptr, 0) 构造，
+    // 再由 init() 通过回调把第一块数据填进来（传非空 data 会被判成 OB_INIT_TWICE）。
+    ObIStreamBuf streambuf(nullptr, 0, param, cb);
+    if (OB_FAIL(streambuf.init())) {
+    } else {
+      uint64_t hdr[3] = {0, 0, 0};
+      const std::streamsize hdr_size = static_cast<std::streamsize>(sizeof(hdr));
+      if (streambuf.sgetn(reinterpret_cast<char *>(hdr), hdr_size) != hdr_size
+          || !obvsag::cuvs_is_dump_magic(hdr[0])) {
+        ret = OB_INVALID_DATA;
+        LOG_WARN("[AMD-CONTEST] bad cuvs payload header", K(ret), K(hdr[0]));
+      } else {
+        const int64_t dim = static_cast<int64_t>(hdr[1]);
+        const int64_t n = static_cast<int64_t>(hdr[2]);
+        if (dim <= 0 || n <= 0 || n > 100000000LL || dim > 65536) {
+          ret = OB_INVALID_DATA;
+          LOG_WARN("[AMD-CONTEST] bad cuvs payload size", K(ret), K(n), K(dim));
+        } else {
+          std::vector<int64_t> ids(static_cast<size_t>(n));
+          std::vector<float> vecs(static_cast<size_t>(n) * static_cast<size_t>(dim));
+          const std::streamsize ids_size = static_cast<std::streamsize>(n * static_cast<int64_t>(sizeof(int64_t)));
+          const std::streamsize vec_size = static_cast<std::streamsize>(n * dim * static_cast<int64_t>(sizeof(float)));
+          if (streambuf.sgetn(reinterpret_cast<char *>(ids.data()), ids_size) != ids_size
+              || streambuf.sgetn(reinterpret_cast<char *>(vecs.data()), vec_size) != vec_size) {
+            ret = OB_INVALID_DATA;
+            LOG_WARN("[AMD-CONTEST] short cuvs payload", K(ret), K(n), K(dim));
+          } else if (0 != obvsag::cuvs_restore_buffer(snap_data_->index_, ids, vecs, static_cast<int>(dim))) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("[AMD-CONTEST] restore cuvs buffer failed", K(ret), K(n), K(dim));
+          } else {
+            LOG_INFO("[AMD-CONTEST] restored cuvs buffer from snapshot", K(n), K(dim));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObPluginVectorIndexAdaptor::serialize(ObIAllocator *allocator, ObOStreamBuf::CbParam &cb_param, ObOStreamBuf::Callback &cb)
 {
   int ret = OB_SUCCESS;
   ObVectorIndexSerializer index_seri(*allocator);
   int64_t snap_index_size = 0;
+  // [AMD-CONTEST] 只有 GPU 缓冲、没有 CPU 图时，写紧凑的向量负载当持久化载体
+  // （vsag 图不存在，不能走 fserialize）。
+  if (is_cuvs_gpu_only_snapshot()) {
+    const int64_t capacity = 1L << 20;
+    char *data = static_cast<char *>(allocator->alloc(capacity));
+    if (OB_ISNULL(data)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("[AMD-CONTEST] alloc serialize buffer failed", K(ret));
+    } else {
+      ObOStreamBuf streambuf(data, capacity, cb_param, cb);
+      int dump_ret = obvsag::cuvs_dump_buffer(snap_data_->index_,
+          [&streambuf](const char *p, int64_t len) -> int {
+            streambuf.sputn(p, len);
+            return streambuf.get_error_code();
+          });
+      streambuf.check_finish();
+      if (0 != dump_ret || OB_SUCCESS != streambuf.get_error_code()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[AMD-CONTEST] dump cuvs buffer failed", K(ret), K(dump_ret), K(streambuf.get_error_code()));
+      } else {
+        snap_data_->rb_flag_ = true;
+        LOG_INFO("[AMD-CONTEST] persisted cuvs buffer payload");
+      }
+    }
+    return ret;
+  }
   // [AMD-CONTEST EXPERIMENT] OB_CUVS_BULK_VSAG=1: rows were only buffered during
   // the DDL append (no per-row CPU HNSW insert). Build the CPU graph once, in
   // bulk, from that buffer right before it is persisted. Same vectors/ids ->
@@ -4289,6 +4368,12 @@ int ObPluginVectorIndexAdaptor::deserialize_snap_data(ObVectorQueryConditions *q
     ObString target_prefix;
     if (!get_snapshot_key_prefix().empty() && key_prefix.prefix_match(get_snapshot_key_prefix()) && !snap_data_->rb_flag_) {
       // skip deserialize, already been deserialized by other concurrent thread
+    } else if (is_cuvs_index()) {
+      // [AMD-CONTEST] lib=cuvs 索引持久化的是 GPU 缓冲负载，不是 vsag 二进制
+      if (OB_FAIL(deserialize_cuvs_buffer(param, cb))) {
+      } else {
+        close_snap_data_rb_flag();
+      }
     } else if (OB_FAIL(index_seri.deserialize(snap_data_->index_, param, cb))) {
     } else if (OB_FAIL(obvectorutil::immutable_optimize(snap_data_->index_))) {
     } else if (OB_FALSE_IT(index_type = get_snap_index_type())) {

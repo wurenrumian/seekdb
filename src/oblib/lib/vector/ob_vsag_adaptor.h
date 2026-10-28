@@ -195,6 +195,10 @@ int cuvs_build_snapshot_from_buffer(void *key);
 // [AMD-CONTEST] true when rows were buffered for this lib=cuvs index (its CPU graph
 // may not have been built yet).
 bool cuvs_has_buffer(void *key);
+// [AMD-CONTEST] 持久化 lib=cuvs 索引的 GPU 缓冲（见 .cpp 里的字节流布局）。
+int cuvs_dump_buffer(void *key, const std::function<int(const char *, int64_t)> &sink);
+int cuvs_restore_buffer(void *key, std::vector<int64_t> &ids, std::vector<float> &vecs, int dim);
+bool cuvs_is_dump_magic(uint64_t magic);
 
 } // namesapce obvsag
 } // namespace common

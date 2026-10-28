@@ -1966,6 +1966,80 @@ int cuvs_build_snapshot_from_buffer(void *key) {
 #endif
 }
 
+
+// [AMD-CONTEST] 持久化：把 lib=cuvs 索引的 GPU 缓冲以紧凑字节流写出。
+// 布局：magic(u64) | dim(u64) | n(u64) | ids(int64 * n) | vectors(float32 * n * dim)
+// 这样重启后可以把行原样恢复到 cuVS 缓冲里，首查询再用它重建 CAGRA —— 既不需要在
+// DDL 里建 CPU HNSW，也不会因为进程重启而丢掉索引。
+static const uint64_t OB_CUVS_DUMP_MAGIC = 0x31535655ULL << 32 | 0x00000043ULL;  // "CUVS1"
+
+bool cuvs_is_dump_magic(uint64_t magic) {
+#ifdef OB_BUILD_CUVS
+  return magic == OB_CUVS_DUMP_MAGIC;
+#else
+  (void)magic;
+  return false;
+#endif
+}
+
+int cuvs_dump_buffer(void *key, const std::function<int(const char *, int64_t)> &sink) {
+#ifdef OB_BUILD_CUVS
+  int ret = 0;
+  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  if (it == g_ob_cuvs_reg.end() || it->second == nullptr || sink == nullptr) {
+    ret = -1;
+  } else {
+    ObCuvsEntry *ent = it->second;
+    const int64_t n = static_cast<int64_t>(ent->buf_ids_.size());
+    if (n <= 0 || ent->dim_ <= 0) {
+      ret = -1;
+    } else {
+      uint64_t hdr[3] = {OB_CUVS_DUMP_MAGIC, static_cast<uint64_t>(ent->dim_), static_cast<uint64_t>(n)};
+      ret = sink(reinterpret_cast<const char *>(hdr), static_cast<int64_t>(sizeof(hdr)));
+      if (0 == ret) {
+        ret = sink(reinterpret_cast<const char *>(ent->buf_ids_.data()), n * static_cast<int64_t>(sizeof(int64_t)));
+      }
+      if (0 == ret) {
+        ret = sink(reinterpret_cast<const char *>(ent->buf_vecs_.data()),
+                   n * static_cast<int64_t>(ent->dim_) * static_cast<int64_t>(sizeof(float)));
+      }
+    }
+  }
+  return ret;
+#else
+  (void)key; (void)sink;
+  return -1;
+#endif
+}
+
+// [AMD-CONTEST] 反序列化：把上面写出的字节流恢复到 cuVS 缓冲，并把 handle 重新标成 lib=cuvs
+// （首查询会自动重建 CAGRA；CPU 回退路径按需建图）。
+int cuvs_restore_buffer(void *key, std::vector<int64_t> &ids, std::vector<float> &vecs, int dim) {
+#ifdef OB_BUILD_CUVS
+  int ret = 0;
+  if (key == nullptr || ids.empty() || dim <= 0
+      || vecs.size() != ids.size() * static_cast<size_t>(dim)) {
+    ret = -1;
+  } else {
+    {
+      std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+      ObCuvsEntry *&slot = g_ob_cuvs_reg[key];
+      if (slot == nullptr) { slot = new ObCuvsEntry(); }
+      slot->dim_ = dim;
+      slot->buf_ids_.swap(ids);
+      slot->buf_vecs_.swap(vecs);
+      slot->built_n_ = 0;  // 首查询触发重建
+    }
+    mark_cuvs_index(key);
+  }
+  return ret;
+#else
+  (void)key; (void)ids; (void)vecs; (void)dim;
+  return -1;
+#endif
+}
+
 } // namespace obvsag
 } // namespace common
 } // namespace oceanbase
