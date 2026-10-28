@@ -608,6 +608,8 @@ public:
   }
 
   int renew_single_snap_index(bool mem_saving_mode);
+  // [AMD-CONTEST] lib=cuvs 索引只攒了 GPU 缓冲、CPU 图尚未构建（无可持久化内容）
+  bool is_cuvs_gpu_only_snapshot();
   int renew_snapdata_in_lock();
   int set_adaptor_ctx_flag(ObVectorQueryAdaptorResultContext *ctx);
 

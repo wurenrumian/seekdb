@@ -183,6 +183,18 @@ long cuvs_batch_knn(const float *base, long n, long dim,
 // index was declared WITH (lib=cuvs). Marked handles use the GPU path.
 void mark_cuvs_index(void *key);
 void unmark_cuvs_index(void *key);
+// [AMD-CONTEST EXPERIMENT] true when `key` is a lib=cuvs index.
+bool is_marked_cuvs_index(void *key);
+// [AMD-CONTEST EXPERIMENT] append rows to the cuVS build buffer WITHOUT building
+// the CPU HNSW index (the GPU path only needs the buffer). Bit-exact w.r.t. the
+// vectors/ids the CAGRA build sees.
+void cuvs_buffer_rows(void *key, const float *vectors, const int64_t *ids, int dim, int size);
+// [AMD-CONTEST EXPERIMENT] Build the CPU HNSW of a lib=cuvs index in bulk from the
+// buffered rows (called once, right before the DDL serializes it).
+int cuvs_build_snapshot_from_buffer(void *key);
+// [AMD-CONTEST] true when rows were buffered for this lib=cuvs index (its CPU graph
+// may not have been built yet).
+bool cuvs_has_buffer(void *key);
 
 } // namesapce obvsag
 } // namespace common

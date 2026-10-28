@@ -282,6 +282,9 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
 }
 }  // anonymous namespace
 
+// [AMD-CONTEST] 见文件尾部的定义：回退到 CPU 前按需构建 lib=cuvs 索引的 CPU 图。
+static void ob_cuvs_ensure_cpu_index(void *key);
+
 static int vsag_errcode2ob(vsag::ErrorType vsag_errcode)
 {
   int ret = OB_ERR_VSAG_RETURN_ERROR;
@@ -1460,6 +1463,7 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
         return OB_SUCCESS;
       }
     }
+    ob_cuvs_ensure_cpu_index(index_handler);
     FilterInterface *bitmap = static_cast<FilterInterface *>(invalid);
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     const IndexType index_type = static_cast<IndexType>(hnsw->get_index_type());
@@ -1509,6 +1513,7 @@ int knn_search(VectorIndexPtr &index_handler, float *query_vector,
         return OB_SUCCESS;
       }
     }
+    ob_cuvs_ensure_cpu_index(index_handler);
     FilterInterface *bitmap = static_cast<FilterInterface *>(invalid);
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     const IndexType index_type = static_cast<IndexType>(hnsw->get_index_type());
@@ -1549,6 +1554,7 @@ int knn_search(obvsag::VectorIndexPtr &index_handler, uint32_t len, uint32_t *di
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[OBVSAG] null pointer addr", K(index_handler), K(dims), K(vals));
   } else {
+    ob_cuvs_ensure_cpu_index(index_handler);
     FilterInterface *bitmap = static_cast<FilterInterface *>(invalid);
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
     const IndexType index_type = static_cast<IndexType>(hnsw->get_index_type());
@@ -1809,6 +1815,99 @@ void unmark_cuvs_index(void *key) {
   g_ob_cuvs_marked.erase(key);
 #else
   (void)key;
+#endif
+}
+
+// [AMD-CONTEST EXPERIMENT] Is this handle a lib=cuvs index? (opt-in marker set by
+// the plugin when the index was declared WITH (lib=cuvs)).
+bool is_marked_cuvs_index(void *key) {
+#ifdef OB_BUILD_CUVS
+  if (key == nullptr) { return false; }
+  std::lock_guard<std::mutex> guard(g_ob_cuvs_marked_mu);
+  return g_ob_cuvs_marked.find(key) != g_ob_cuvs_marked.end();
+#else
+  (void)key;
+  return false;
+#endif
+}
+
+// [AMD-CONTEST EXPERIMENT] GPU-only ingest: buffer the rows for the CAGRA build
+// and skip the per-row CPU HNSW insert. Used by add_snap_index when
+// OB_CUVS_SKIP_VSAG=1 (see the measurement notes in tmp/).
+void cuvs_buffer_rows(void *key, const float *vectors, const int64_t *ids, int dim, int size) {
+#ifdef OB_BUILD_CUVS
+  ob_cuvs_add(key, vectors, ids, dim, size);
+#else
+  (void)key; (void)vectors; (void)ids; (void)dim; (void)size;
+#endif
+}
+
+
+// [AMD-CONTEST] lib=cuvs 索引的行只进了 GPU 缓冲、CPU HNSW 还没建？
+bool cuvs_has_buffer(void *key) {
+#ifdef OB_BUILD_CUVS
+  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  return it != g_ob_cuvs_reg.end() && it->second != nullptr && !it->second->buf_ids_.empty();
+#else
+  (void)key;
+  return false;
+#endif
+}
+
+// [AMD-CONTEST] 回退到 CPU 之前，若该 lib=cuvs 索引的 CPU 图还没建就按需建一次
+// （filter/delete/过期索引这些路径仍然要有可用的 CPU 索引，语义不变，只是把建图推迟到真正需要时）。
+static void ob_cuvs_ensure_cpu_index(void *key) {
+#ifdef OB_BUILD_CUVS
+  HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(key);
+  if (hnsw == nullptr || !ob_cuvs_marked(key) || !cuvs_has_buffer(key)) { return; }
+  if (hnsw->get_index_number() != 0) { return; }
+  int ret = cuvs_build_snapshot_from_buffer(key);
+  LOG_INFO("[AMD-CONTEST] lazy vsag build for CPU fallback", KP(key), K(ret));
+#else
+  (void)key;
+#endif
+}
+
+// [AMD-CONTEST EXPERIMENT] Bulk-build the CPU HNSW index of a lib=cuvs index from
+// the buffered rows (one vsag build_index call instead of N per-row inserts).
+// Used at DDL serialization time when OB_CUVS_BULK_VSAG=1: the GPU path only needs
+// vecbufs_, so the CPU graph is produced once, in bulk, right before it is
+// persisted (semantics/persistence unchanged).
+int cuvs_build_snapshot_from_buffer(void *key) {
+#ifdef OB_BUILD_CUVS
+  int ret = 0;
+  std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
+  auto it = g_ob_cuvs_reg.find(key);
+  if (it == g_ob_cuvs_reg.end() || it->second == nullptr) {
+    ret = -1;
+  } else {
+    ObCuvsEntry *ent = it->second;
+    const int64_t n = static_cast<int64_t>(ent->buf_ids_.size());
+    if (n <= 0 || ent->dim_ <= 0) {
+      ret = -1;
+    } else {
+      HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(key);
+      // vsag 的建图线程数（seekdb 从不设置，默认值通常很小）——批量建时临时调高。
+      const char *th = ::getenv("OB_CUVS_VSAG_BUILD_THREADS");
+      if (th != nullptr && th[0] != '\0') {
+        const size_t nthreads = static_cast<size_t>(::atoi(th));
+        if (nthreads > 0) { vsag::Options::Instance().set_num_threads_building(nthreads); }
+      }
+      DatasetPtr dataset = vsag::Dataset::Make();
+      dataset->Dim(ent->dim_)
+          ->NumElements(n)
+          ->Ids(ent->buf_ids_.data())
+          ->Float32Vectors(ent->buf_vecs_.data())
+          ->Owner(false);
+      ret = hnsw->build_index(dataset);
+      LOG_INFO("[OBVSAG][cuVS] bulk vsag build from cuVS buffer", KP(key), K(n), K(ent->dim_), K(ret));
+    }
+  }
+  return ret;
+#else
+  (void)key;
+  return -1;
 #endif
 }
 

@@ -1096,8 +1096,15 @@ int ObHNSWIndexBuildOperator::serialize_vector_index(
         LOG_INFO("HgraphIndex finish vsag serialize for tablet", K(tablet_id_), K(ctx.ctx_.get_vals().count()), K(type));
       }
       if (OB_SUCC(ret)) {
-        if (OB_FAIL(adp->renew_single_snap_index((type == VIAT_HNSW_BQ || type == VIAT_IPIVF)
-            || (GCONF.vector_index_memory_saving_mode && (type == VIAT_HNSW || type == VIAT_HNSW_SQ || type == VIAT_HGRAPH))))) {
+        bool mem_saving_mode = (type == VIAT_HNSW_BQ || type == VIAT_IPIVF)
+            || (GCONF.vector_index_memory_saving_mode && (type == VIAT_HNSW || type == VIAT_HNSW_SQ || type == VIAT_HGRAPH));
+        // [AMD-CONTEST] lib=cuvs 索引的 CPU 图还没建（行只在 GPU 缓冲里），此时没有可
+        // 持久化的内容；若按 memory_saving_mode 释放内存 adaptor，cuVS 缓冲会一起丢，
+        // 首查询就建不出 CAGRA 图。所以这种情况必须把 adaptor 留在内存里。
+        if (adp->is_cuvs_gpu_only_snapshot()) {
+          mem_saving_mode = false;
+        }
+        if (OB_FAIL(adp->renew_single_snap_index(mem_saving_mode))) {
         }
       }
     }

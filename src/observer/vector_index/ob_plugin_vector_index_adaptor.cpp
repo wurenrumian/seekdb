@@ -1822,7 +1822,17 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
           lib::ObLightBacktraceGuard light_backtrace_guard(false);
           if (!is_sparse_vector_index_type()) {
             ob_mark_cuvs_if_needed(algo_data_, snap_data_->index_);
-            if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, dim, extra_info_buf, num))) {
+            // [AMD-CONTEST EXPERIMENT] OB_CUVS_SKIP_VSAG=1: for a lib=cuvs index
+            // only buffer the rows for the GPU CAGRA build and skip the per-row
+            // CPU HNSW insert (that insert dominates DDL time and is unused by the
+            // GPU-served workload). Same vectors/ids reach CAGRA either way.
+            // [AMD-CONTEST] 默认行为：lib=cuvs 索引在 DDL 期间只攒 GPU 缓冲，不建 CPU HNSW
+            // （CPU 图只在真正需要回退时才建，见 ob_cuvs_ensure_cpu_index）。
+            // OB_CUVS_LEGACY_VSAG=1 可恢复逐行建图，用于 A/B 对照。
+            static const bool skip_vsag_for_cuvs = (nullptr == ::getenv("OB_CUVS_LEGACY_VSAG"));
+            if (skip_vsag_for_cuvs && obvsag::is_marked_cuvs_index(snap_data_->index_)) {
+              obvsag::cuvs_buffer_rows(snap_data_->index_, vectors, vids, static_cast<int>(dim), num);
+            } else if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, vectors, vids, dim, extra_info_buf, num))) {
             }
           } else {
             if (OB_FAIL(obvectorutil::add_index(snap_data_->index_, lens, dims, vals, vids, num, extra_info_buf))) {
@@ -2300,7 +2310,13 @@ int ObPluginVectorIndexAdaptor::write_into_delta_mem(ObVectorQueryAdaptorResultC
       lib::ObLightBacktraceGuard light_backtrace_guard(false);
       if (OB_SUCC(ret)) {
         if (!is_sparse_vector_index_type()) {
-          if (OB_FAIL(obvectorutil::add_index(incr_data_->index_,
+          // [AMD-CONTEST EXPERIMENT] OB_CUVS_SKIP_VSAG=1: lib=cuvs 索引只攒缓冲（见 add_snap_index）。
+          static const bool skip_vsag_for_cuvs_ins = (nullptr != ::getenv("OB_CUVS_SKIP_VSAG"));
+          if (skip_vsag_for_cuvs_ins && obvsag::is_marked_cuvs_index(incr_data_->index_)) {
+            obvsag::cuvs_buffer_rows(incr_data_->index_, vectors,
+                                     reinterpret_cast<int64_t *>(vids),
+                                     static_cast<int>(ctx->get_dim()), static_cast<int>(count));
+          } else if (OB_FAIL(obvectorutil::add_index(incr_data_->index_,
                                              vectors,
                                              reinterpret_cast<int64_t *>(vids),
                                              ctx->get_dim(),
@@ -3290,6 +3306,20 @@ int ObPluginVectorIndexAdaptor::serialize(ObIAllocator *allocator, ObOStreamBuf:
   int ret = OB_SUCCESS;
   ObVectorIndexSerializer index_seri(*allocator);
   int64_t snap_index_size = 0;
+  // [AMD-CONTEST EXPERIMENT] OB_CUVS_BULK_VSAG=1: rows were only buffered during
+  // the DDL append (no per-row CPU HNSW insert). Build the CPU graph once, in
+  // bulk, from that buffer right before it is persisted. Same vectors/ids ->
+  // same index content; only the construction strategy changes.
+  static const bool bulk_vsag_for_cuvs = (nullptr != ::getenv("OB_CUVS_BULK_VSAG"));
+  if (bulk_vsag_for_cuvs && OB_NOT_NULL(snap_data_) && OB_NOT_NULL(snap_data_->index_)
+      && obvsag::is_marked_cuvs_index(snap_data_->index_)) {
+    int64_t existing = 0;
+    int tmp_ret = obvectorutil::get_index_number(snap_data_->index_, existing);
+    if (OB_SUCCESS == tmp_ret && 0 == existing) {
+      int bulk_ret = obvsag::cuvs_build_snapshot_from_buffer(snap_data_->index_);
+      LOG_INFO("[AMD-CONTEST] bulk vsag build at serialize", K(bulk_ret), K(existing));
+    }
+  }
   if (!snap_data_->is_inited()) {
     ret = OB_NOT_INIT;
     LOG_WARN("snap index is not init", K(ret));
@@ -3304,6 +3334,21 @@ int ObPluginVectorIndexAdaptor::serialize(ObIAllocator *allocator, ObOStreamBuf:
     snap_data_->rb_flag_ = true;
   }
   return ret;
+}
+
+// [AMD-CONTEST] 该索引是不是「只有 GPU 缓冲、还没有 CPU 图」的 lib=cuvs 索引。
+// 这种索引在 DDL 收尾时没有任何东西可持久化；如果按 memory_saving_mode 把内存
+// adaptor 释放掉，cuVS 缓冲会跟着丢，首查询就再也建不出 CAGRA 图。
+bool ObPluginVectorIndexAdaptor::is_cuvs_gpu_only_snapshot()
+{
+  bool b = false;
+  if (OB_NOT_NULL(snap_data_) && OB_NOT_NULL(snap_data_->index_)) {
+    int64_t num = 0;
+    if (OB_SUCCESS == obvectorutil::get_index_number(snap_data_->index_, num) && 0 == num) {
+      b = obvsag::cuvs_has_buffer(snap_data_->index_);
+    }
+  }
+  return b;
 }
 
 int ObPluginVectorIndexAdaptor::renew_single_snap_index(bool mem_saving_mode)
