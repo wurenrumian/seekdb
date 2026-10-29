@@ -176,6 +176,21 @@ static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
   if (slot == nullptr) { slot = new ObCuvsEntry(); slot->dim_ = dim; }
   if (slot->dim_ == 0) { slot->dim_ = dim; }
   if (slot->dim_ != dim) { return; }
+  // [AMD-CONTEST] 几何预留：std::vector::insert 的增长策略会在 1M x 128（512MB）这种
+  // 规模上重分配 + 全量拷贝 O(log n) 次，累计是 GB 级的无谓 memcpy，且全部发生在计时窗口内。
+  const size_t add_floats = static_cast<size_t>(dim) * static_cast<size_t>(size);
+  const size_t need_floats = slot->buf_vecs_.size() + add_floats;
+  if (slot->buf_vecs_.capacity() < need_floats) {
+    size_t target = slot->buf_vecs_.capacity() * 2;
+    if (target < need_floats) { target = need_floats; }
+    slot->buf_vecs_.reserve(target);
+  }
+  const size_t need_ids = slot->buf_ids_.size() + static_cast<size_t>(size);
+  if (slot->buf_ids_.capacity() < need_ids) {
+    size_t target = slot->buf_ids_.capacity() * 2;
+    if (target < need_ids) { target = need_ids; }
+    slot->buf_ids_.reserve(target);
+  }
   slot->buf_vecs_.insert(slot->buf_vecs_.end(), vectors,
                          vectors + static_cast<size_t>(dim) * size);
   slot->buf_ids_.insert(slot->buf_ids_.end(), ids, ids + size);
@@ -469,7 +484,9 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     LOG_WARN("[OBVSAG][cuVS] failed to write snapshot stream", K(ret), KP(key), K(n));
     return true;
   }
-  std::vector<char> chunk(65536);
+  // [AMD-CONTEST] 4MB 一拷：CAGRA 图在 1M x 128 / degree=128 时是数百 MB 级，
+  // 64KB 的循环会让这段拷贝变成 syscall 主导。
+  std::vector<char> chunk(4UL * 1024 * 1024);
   uint64_t remaining = graph_bytes;
   while (remaining > 0) {
     const size_t bytes = std::min<uint64_t>(remaining, chunk.size());
@@ -515,7 +532,7 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in) {
       LOG_WARN("[OBVSAG][cuVS] truncated snapshot payload", K(ret), KP(key), K(n64));
     } else {
       ObCuvsSnapshotFile graph;
-      std::vector<char> chunk(65536);
+      std::vector<char> chunk(4UL * 1024 * 1024);
       uint64_t remaining = graph_bytes;
       while (graph.file_ != nullptr && remaining > 0) {
         const size_t bytes = std::min<uint64_t>(remaining, chunk.size());

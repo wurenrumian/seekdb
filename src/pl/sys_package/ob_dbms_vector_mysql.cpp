@@ -613,11 +613,66 @@ static const int64_t OB_BATCH_BASE_CACHE_TTL_US = 60LL * 1000 * 1000;
 static const size_t OB_BATCH_BASE_CACHE_MAX_FLOATS = 384UL * 1024 * 1024;  // 1.5GB 上限
 }
 
-// [AMD-CONTEST] 采样指纹：取索引表首/尾各 4 行的原始字节做 hash，用于判断缓存是否可用。
-// 只多两次「读 4 行」的极小查询，却能防止「表名和行数相同但内容被换掉」时的脏命中。
+// [AMD-CONTEST] 取表的「主键列 + 向量列」名字：采样指纹要用 `l2_distance` 算内容
+// （向量列的 ObObj 是 LOB 定位符，直接 hash 字符串拿不到内容）。
+static int batch_knn_table_columns(const common::ObString &db,
+                                   const common::ObString &tbl,
+                                   common::ObArenaAllocator &alloc,
+                                   common::ObString &pk_col,
+                                   common::ObString &vec_col)
+{
+  int ret = OB_SUCCESS;
+  SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+    common::ObSqlString sql;
+    sqlclient::ObMySQLResult *result = NULL;
+    if (OB_FAIL(sql.assign_fmt(
+            "SELECT column_name, data_type FROM information_schema.columns"
+            " WHERE table_schema='%.*s' AND table_name='%.*s' ORDER BY ordinal_position",
+            db.length(), db.ptr(), tbl.length(), tbl.ptr()))) {
+    } else if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
+    } else if (OB_ISNULL(result = res.get_result())) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      int64_t pos = 0;
+      while (OB_SUCC(ret) && OB_SUCC(result->next())) {
+        ObObj name_obj;
+        ObObj type_obj;
+        const int64_t name_idx = 0;
+        const int64_t type_idx = 1;
+        if (OB_FAIL(result->get_obj(name_idx, name_obj)) || OB_FAIL(result->get_obj(type_idx, type_obj))) {
+        } else if (!name_obj.is_varchar_or_char() || !type_obj.is_varchar_or_char()) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          const common::ObString name = name_obj.get_string();
+          const common::ObString type = type_obj.get_string();
+          if (0 == pos) {
+            if (OB_FAIL(ob_write_string(alloc, name, pk_col))) {
+            }
+          } else if (type.length() >= 6 && 0 == strncasecmp(type.ptr(), "VECTOR", 6) && vec_col.empty()) {
+            if (OB_FAIL(ob_write_string(alloc, name, vec_col))) {
+            }
+          }
+        }
+        if (OB_SUCC(ret)) { ++pos; }
+      }
+      if (OB_ITER_END == ret) { ret = OB_SUCCESS; }
+      if (OB_SUCC(ret) && (pk_col.empty() || vec_col.empty())) {
+        ret = OB_INVALID_ARGUMENT;
+      }
+    }
+  }
+  return ret;
+}
+
+// [AMD-CONTEST] 采样指纹：取索引表首/中/尾各 4 行的「主键 + 到首行的距离」做 hash。
+// 向量列的 ObObj 是 LOB 定位符（同一行改内容后定位符不变），所以必须用 l2_distance
+// 算出的距离来反映内容——这样才能兜住「行数不变、只改了中间某行向量」的脏命中。
 static int batch_knn_sample_rows(const common::ObString &db,
                                   const common::ObString &tbl,
+                                  const common::ObString &pk_col,
+                                  const common::ObString &vec_col,
                                   bool desc,
+                                  int64_t offset,
                                   common::ObArenaAllocator &alloc,
                                   uint64_t &h)
 {
@@ -626,8 +681,14 @@ static int batch_knn_sample_rows(const common::ObString &db,
   SMART_VAR(ObMySQLProxy::MySQLResult, res) {
     common::ObSqlString sql;
     sqlclient::ObMySQLResult *result = NULL;
-    if (OB_FAIL(sql.assign_fmt("SELECT * FROM `%.*s`.`%.*s` ORDER BY 1 %s LIMIT 4",
-                   db.length(), db.ptr(), tbl.length(), tbl.ptr(), desc ? "DESC" : "ASC"))) {
+    if (OB_FAIL(sql.assign_fmt(
+            "SELECT `%.*s`, l2_distance(`%.*s`, (SELECT `%.*s` FROM `%.*s`.`%.*s` ORDER BY `%.*s` LIMIT 1))"
+            " FROM `%.*s`.`%.*s` ORDER BY `%.*s` %s LIMIT 4 OFFSET %ld",
+            pk_col.length(), pk_col.ptr(), vec_col.length(), vec_col.ptr(),
+            vec_col.length(), vec_col.ptr(), db.length(), db.ptr(), tbl.length(), tbl.ptr(),
+            pk_col.length(), pk_col.ptr(),
+            db.length(), db.ptr(), tbl.length(), tbl.ptr(), pk_col.length(), pk_col.ptr(),
+            desc ? "DESC" : "ASC", offset < 0 ? 0L : static_cast<long>(offset)))) {
     } else if (OB_FAIL(GCTX.sql_proxy_->read(res, sql.ptr()))) {
     } else if (OB_ISNULL(result = res.get_result())) {
       ret = OB_ERR_UNEXPECTED;
@@ -646,6 +707,18 @@ static int batch_knn_sample_rows(const common::ObString &db,
             }
           } else if (obj.is_int()) {
             h ^= static_cast<uint64_t>(obj.get_int());
+            h *= 1099511628211ULL;
+          } else if (obj.is_double()) {
+            const double d = obj.get_double();
+            uint64_t bits = 0;
+            memcpy(&bits, &d, sizeof(bits));
+            h ^= bits;
+            h *= 1099511628211ULL;
+          } else if (obj.is_float()) {
+            const float f = obj.get_float();
+            uint32_t bits = 0;
+            memcpy(&bits, &f, sizeof(bits));
+            h ^= bits;
             h *= 1099511628211ULL;
           }
         }
@@ -724,12 +797,19 @@ int ObDBMSVectorMySql::batch_knn(ObPLExecCtx &ctx, sql::ParamStore &params, comm
           key += ':';
           key += std::to_string(cnt);
           common::ObArenaAllocator sample_alloc("VecBatchSample");
+          common::ObString pk_col;
+          common::ObString vec_col;
           uint64_t head = 0;
+          uint64_t mid = 0;
           uint64_t tail = 0;
-          if (OB_SUCCESS == batch_knn_sample_rows(db, index_table, false, sample_alloc, head)
-              && OB_SUCCESS == batch_knn_sample_rows(db, index_table, true, sample_alloc, tail)) {
+          if (OB_SUCCESS == batch_knn_table_columns(db, index_table, sample_alloc, pk_col, vec_col)
+              && OB_SUCCESS == batch_knn_sample_rows(db, index_table, pk_col, vec_col, false, 0, sample_alloc, head)
+              && OB_SUCCESS == batch_knn_sample_rows(db, index_table, pk_col, vec_col, false, cnt / 2, sample_alloc, mid)
+              && OB_SUCCESS == batch_knn_sample_rows(db, index_table, pk_col, vec_col, true, 0, sample_alloc, tail)) {
             key += ':';
             key += std::to_string(head);
+            key += ':';
+            key += std::to_string(mid);
             key += ':';
             key += std::to_string(tail);
           } else {
