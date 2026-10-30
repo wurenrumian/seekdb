@@ -1250,8 +1250,13 @@ int ObDDLUtil::get_temp_store_compress_type(const ObCompressorType schema_compr_
     } else if (0 == GCONF._ob_ddl_temp_file_compress_func.get_value_string().case_compare("ZSTD")) {
       compr_type = ZSTD_1_3_8_COMPRESSOR;
     } else if (0 == GCONF._ob_ddl_temp_file_compress_func.get_value_string().case_compare("AUTO")) {
-      UNUSED(parallel);
-      if (schema_compr_type > INVALID_COMPRESSOR && schema_compr_type < MAX_COMPRESSOR) {
+      if (parallel <= 1) {
+        // [AMD-CONTEST] AUTO + 单线程 spool ⇒ 不压缩。压缩本身是纯串行 CPU：200k x 128 的
+        // vector index DDL 里 zstd 占扫描线程约 1/3 的采样（本机 3.44s 窗口里 zstd 2.87s -> 2.27s）；
+        // parallel <= 1 时又没有并行 I/O 能拿压缩比去换时间，所以这里直接选 NONE。
+        // parallel >= 2 仍按源表压缩类型，显式 ZSTD / NONE 也不受影响。
+        compr_type = NONE_COMPRESSOR;
+      } else if (schema_compr_type > INVALID_COMPRESSOR && schema_compr_type < MAX_COMPRESSOR) {
         compr_type = schema_compr_type;
       } else {
         compr_type = NONE_COMPRESSOR;
