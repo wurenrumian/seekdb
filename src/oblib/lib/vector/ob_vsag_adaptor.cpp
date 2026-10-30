@@ -24,6 +24,8 @@
 #include <atomic>
 #include <vector>
 #include <memory>
+#include <new>
+#include <condition_variable>
 #include <limits>
 #include <unistd.h>
 #include <istream>
@@ -82,6 +84,16 @@ using namespace vsag;
 // runs seekdb's real vector-adaptor data path on the GPU. PoC: single writer per
 // index, results allocated with the handle's allocator (drop-in with VSAG path).
 namespace {
+// [AMD-CONTEST] 后台建图的完成信号。DDL 序列化时把 build 交给一个 detached 线程，
+// 它和「快照写盘 + DDL 收尾 + 客户端往返」重叠；首查询在这里等剩下的那一段。
+// 注意：任务拿的是向量的**副本**，因为 DDL 的 adaptor 可能比建图先被销毁。
+struct ObCuvsBuildFuture {
+  std::mutex mu_;
+  std::condition_variable cv_;
+  bool done_ = false;
+  size_t n_ = 0;
+  std::shared_ptr<void> bridge_;
+};
 struct ObCuvsEntry {
   std::shared_ptr<void> bridge_;// opaque handle from seekdb_cuvs_build
   int dim_ = 0;
@@ -89,6 +101,8 @@ struct ObCuvsEntry {
   std::vector<float> buf_vecs_; // accumulated vectors (row-major) from add_index
   std::vector<int64_t> buf_ids_;// accumulated external vids from add_index
   size_t built_n_ = 0;          // #vectors present when cuVS was last (re)built
+  std::shared_ptr<ObCuvsBuildFuture> build_fut_; // in-flight background build, if any
+  size_t build_fut_n_ = 0;
   bool vsag_ready_ = false;     // CPU fallback is built only when it is needed
 };
 static std::mutex g_ob_cuvs_mu;
@@ -154,6 +168,56 @@ static std::shared_ptr<void> ob_cuvs_build_big_stack(const float *base, long n, 
   if (pthread_create(&tid, &attr, ob_cuvs_build_job, &job) == 0) { pthread_join(tid, nullptr); }
   pthread_attr_destroy(&attr);
   return ob_cuvs_wrap(job.out);
+}
+// [AMD-CONTEST] 后台建图：detached 32MB 栈线程 + 向量副本。DDL 序列化时启动，
+// 与「快照写盘 + DDL 收尾 + 客户端往返」重叠；首查询用 ob_cuvs_wait_build 等余下部分。
+// 副本是必要的：DDL 的 adaptor/entry 可能比建图先被销毁，直接拿 buf_vecs_ 的指针会悬空。
+struct ObCuvsAsyncBuildCtx {
+  std::vector<float> vecs_;
+  long n_ = 0;
+  long dim_ = 0;
+  std::shared_ptr<ObCuvsBuildFuture> fut_;
+};
+static void *ob_cuvs_async_build_job(void *arg) {
+  ObCuvsAsyncBuildCtx *ctx = static_cast<ObCuvsAsyncBuildCtx *>(arg);
+  std::shared_ptr<void> out = ob_cuvs_wrap(seekdb_cuvs_build(ctx->vecs_.data(), ctx->n_, ctx->dim_));
+  {
+    std::lock_guard<std::mutex> guard(ctx->fut_->mu_);
+    ctx->fut_->bridge_ = out;
+    ctx->fut_->done_ = true;
+  }
+  ctx->fut_->cv_.notify_all();
+  delete ctx;
+  return nullptr;
+}
+static std::shared_ptr<ObCuvsBuildFuture> ob_cuvs_start_async_build(
+    const std::vector<float> &vecs, long n, long dim) {
+  std::shared_ptr<ObCuvsBuildFuture> fut = std::make_shared<ObCuvsBuildFuture>();
+  ObCuvsAsyncBuildCtx *ctx = new (std::nothrow) ObCuvsAsyncBuildCtx();
+  if (fut == nullptr || ctx == nullptr) { delete ctx; return nullptr; }
+  ctx->vecs_ = vecs;
+  ctx->n_ = n;
+  ctx->dim_ = dim;
+  ctx->fut_ = fut;
+  fut->n_ = static_cast<size_t>(n);
+  pthread_t tid;
+  pthread_attr_t attr;
+  int rc = pthread_attr_init(&attr);
+  if (0 == rc) {
+    rc = pthread_attr_setstacksize(&attr, 32UL * 1024 * 1024);
+    if (0 == rc) { rc = pthread_create(&tid, &attr, ob_cuvs_async_build_job, ctx); }
+    pthread_attr_destroy(&attr);
+  }
+  if (0 != rc) { delete ctx; return nullptr; }
+  pthread_detach(tid);
+  return fut;
+}
+// 等后台建图结束；返回 nullptr 表示建图失败（调用方退回同步建图 / VSAG）。
+static std::shared_ptr<void> ob_cuvs_wait_build(const std::shared_ptr<ObCuvsBuildFuture> &fut) {
+  if (fut == nullptr) { return std::shared_ptr<void>(); }
+  std::unique_lock<std::mutex> lock(fut->mu_);
+  fut->cv_.wait(lock, [&fut] { return fut->done_; });
+  return fut->bridge_;
 }
 static void ob_cuvs_register(void *key, const float *vectors, const int64_t *ids,
                              int dim, int size) {
@@ -336,6 +400,18 @@ static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
   // nothing is built yet or the buffer grew materially (>=2x). Build+search run on
   // a 32MB-stack pthread (cuVS overflows the OB worker stack otherwise).
   const size_t n = ent->buf_ids_.size();
+  // [AMD-CONTEST] 接手 DDL 期启动的后台建图：等它跑完剩下的部分（已与快照写盘/DDL 收尾重叠）。
+  if (ent->bridge_ == nullptr && ent->build_fut_ != nullptr) {
+    std::shared_ptr<void> built_handle = ob_cuvs_wait_build(ent->build_fut_);
+    if (built_handle != nullptr) {
+      ent->bridge_ = built_handle;
+      ent->built_n_ = ent->build_fut_n_;
+      ent->ids_ = ent->buf_ids_;
+      ob_vsag_trace("cuvs_build_adopt", key, static_cast<long>(ent->dim_), static_cast<long>(n));
+    }
+    ent->build_fut_.reset();
+    ent->build_fut_n_ = 0;
+  }
   const bool need_build =
       (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
   std::vector<unsigned> off(topk);
@@ -397,7 +473,12 @@ struct ObCuvsHandoffSlot {
   uint64_t token_ = 0;
   size_t n_ = 0;
   int32_t dim_ = 0;
+  std::shared_ptr<void> bridge_;                // 已建好的句柄
+  std::shared_ptr<ObCuvsBuildFuture> fut_;      // 或者：还在后台建的 future
+};
+struct ObCuvsHandoffPayload {
   std::shared_ptr<void> bridge_;
+  std::shared_ptr<ObCuvsBuildFuture> fut_;
 };
 static std::mutex g_ob_cuvs_handoff_mu;
 static std::deque<ObCuvsHandoffSlot> g_ob_cuvs_handoff;
@@ -412,8 +493,9 @@ static uint64_t ob_cuvs_new_handoff_token() {
 }
 
 static void ob_cuvs_handoff_stash(uint64_t token, size_t n, int32_t dim,
-                                  const std::shared_ptr<void> &bridge) {
-  if (bridge == nullptr) { return; }
+                                  const std::shared_ptr<void> &bridge,
+                                  const std::shared_ptr<ObCuvsBuildFuture> &fut) {
+  if (bridge == nullptr && fut == nullptr) { return; }
   std::lock_guard<std::mutex> guard(g_ob_cuvs_handoff_mu);
   while (g_ob_cuvs_handoff.size() >= OB_CUVS_HANDOFF_SLOTS) {
     g_ob_cuvs_handoff.pop_front();  // 最老的没人来取：索引大概被 DROP 了，释放显存
@@ -423,19 +505,22 @@ static void ob_cuvs_handoff_stash(uint64_t token, size_t n, int32_t dim,
   slot.n_ = n;
   slot.dim_ = dim;
   slot.bridge_ = bridge;
+  slot.fut_ = fut;
   g_ob_cuvs_handoff.push_back(slot);
 }
 
-static std::shared_ptr<void> ob_cuvs_handoff_take(uint64_t token, size_t n, int32_t dim) {
+static ObCuvsHandoffPayload ob_cuvs_handoff_take(uint64_t token, size_t n, int32_t dim) {
+  ObCuvsHandoffPayload out;
   std::lock_guard<std::mutex> guard(g_ob_cuvs_handoff_mu);
   for (auto it = g_ob_cuvs_handoff.begin(); it != g_ob_cuvs_handoff.end(); ++it) {
     if (it->token_ == token && it->n_ == n && it->dim_ == dim) {
-      std::shared_ptr<void> bridge = it->bridge_;
+      out.bridge_ = it->bridge_;
+      out.fut_ = it->fut_;
       g_ob_cuvs_handoff.erase(it);
-      return bridge;
+      break;
     }
   }
-  return std::shared_ptr<void>();
+  return out;
 }
 
 // [AMD-CONTEST] CAGRA 图的中转文件：v5 用 ::tmpfile()，落到 /tmp 上就是一条完整磁盘往返
@@ -530,8 +615,66 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     return false;
   }
   const int64_t start_us = ObTimeUtility::current_time();
+  const int32_t dim32 = ent->dim_;
+  const int32_t reserved = 0;
+  const int64_t n64 = static_cast<int64_t>(n);
+  const bool fresh = (ent->bridge_ != nullptr && ent->built_n_ == n);
+
+  // [AMD-CONTEST] 默认走 OBCUVS03：快照只留 ids + 向量，建好的 device 句柄留给首查询。
+  // OB_CUVS_SNAPSHOT_GRAPH=1 回到 v5 的 OBCUVS02（把 CAGRA 图也写进快照），用于 A/B 与兜底。
+  const char *graph_env = ::getenv("OB_CUVS_SNAPSHOT_GRAPH");
+  const bool persist_graph = graph_env != nullptr && graph_env[0] == '1';
+  if (!persist_graph) {
+    // [AMD-CONTEST] 快照不再包含图，所以建图不必在这里同步做完：交给后台线程，
+    // 与「写快照 payload + DDL 收尾 + 客户端往返」重叠，首查询只等剩下的那一段。
+    const char *sync_env = ::getenv("OB_CUVS_SYNC_BUILD");
+    const bool force_sync = sync_env != nullptr && sync_env[0] == '1';
+    std::shared_ptr<void> ready = fresh ? ent->bridge_ : std::shared_ptr<void>();
+    std::shared_ptr<ObCuvsBuildFuture> fut;
+    bool built = false;
+    if (!fresh) {
+      if (ent->build_fut_ != nullptr && ent->build_fut_n_ == n) {
+        fut = ent->build_fut_;  // 已经有一次同规模的建图在飞，别重复建
+      } else if (!force_sync) {
+        fut = ob_cuvs_start_async_build(ent->buf_vecs_, static_cast<long>(n), dim32);
+        if (fut != nullptr) {
+          ent->build_fut_ = fut;
+          ent->build_fut_n_ = n;
+        }
+      }
+      if (fut == nullptr) {
+        // 起不了线程 / 强制同步（A/B 用）：退回同步建图
+        ready = ob_cuvs_build_big_stack(ent->buf_vecs_.data(), static_cast<long>(n), dim32);
+        if (ready == nullptr) {
+          ret = OB_ERR_VSAG_RETURN_ERROR;
+          LOG_WARN("[OBVSAG][cuVS] GPU CAGRA build failed during snapshot serialize",
+                   K(ret), KP(key), K(n), K(ent->dim_));
+          return true;
+        }
+        ent->bridge_ = ready; ent->built_n_ = n; ent->ids_ = ent->buf_ids_;
+        built = true;
+      }
+    }
+    const uint64_t token = ob_cuvs_new_handoff_token();
+    ob_cuvs_handoff_stash(token, n, dim32, ready, fut);
+    if (!ob_cuvs_write(out, OB_CUVS_SNAPSHOT_MAGIC_V3, sizeof(OB_CUVS_SNAPSHOT_MAGIC_V3)) ||
+        !ob_cuvs_write(out, &token, sizeof(token)) ||
+        !ob_cuvs_write(out, &dim32, sizeof(dim32)) ||
+        !ob_cuvs_write(out, &reserved, sizeof(reserved)) ||
+        !ob_cuvs_write(out, &n64, sizeof(n64)) ||
+        !ob_cuvs_write(out, ent->buf_ids_.data(), n * sizeof(int64_t)) ||
+        !ob_cuvs_write(out, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("[OBVSAG][cuVS] failed to write handoff snapshot stream", K(ret), KP(key), K(n));
+      return true;
+    }
+    const bool is_async = (fut != nullptr);
+    LOG_INFO("[OBVSAG][cuVS] handed off GPU CAGRA graph to the first query", KP(key), K(n),
+             K(dim32), K(built), K(is_async));
+    return true;
+  }
   bool built = false;
-  if (ent->bridge_ == nullptr || ent->built_n_ != n) {
+  if (!fresh) {
     std::shared_ptr<void> nb = ob_cuvs_build_big_stack(ent->buf_vecs_.data(),
                                                        static_cast<long>(n), ent->dim_);
     if (nb == nullptr) {
@@ -544,32 +687,6 @@ static bool ob_cuvs_serialize(void *key, std::ostream &out, int &ret) {
     built = true;
   }
   const int64_t build_us = ObTimeUtility::current_time() - start_us;
-  const int32_t dim32 = ent->dim_;
-  const int32_t reserved = 0;
-  const int64_t n64 = static_cast<int64_t>(n);
-
-  // [AMD-CONTEST] 默认走 OBCUVS03：快照只留 ids + 向量，建好的 device 句柄留给首查询。
-  // OB_CUVS_SNAPSHOT_GRAPH=1 回到 v5 的 OBCUVS02（把 CAGRA 图也写进快照），用于 A/B 与兜底。
-  const char *graph_env = ::getenv("OB_CUVS_SNAPSHOT_GRAPH");
-  const bool persist_graph = graph_env != nullptr && graph_env[0] == '1';
-  if (!persist_graph) {
-    const uint64_t token = ob_cuvs_new_handoff_token();
-    ob_cuvs_handoff_stash(token, n, dim32, ent->bridge_);
-    if (!ob_cuvs_write(out, OB_CUVS_SNAPSHOT_MAGIC_V3, sizeof(OB_CUVS_SNAPSHOT_MAGIC_V3)) ||
-        !ob_cuvs_write(out, &token, sizeof(token)) ||
-        !ob_cuvs_write(out, &dim32, sizeof(dim32)) ||
-        !ob_cuvs_write(out, &reserved, sizeof(reserved)) ||
-        !ob_cuvs_write(out, &n64, sizeof(n64)) ||
-        !ob_cuvs_write(out, ent->buf_ids_.data(), n * sizeof(int64_t)) ||
-        !ob_cuvs_write(out, ent->buf_vecs_.data(), ent->buf_vecs_.size() * sizeof(float))) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("[OBVSAG][cuVS] failed to write handoff snapshot stream", K(ret), KP(key), K(n));
-      return true;
-    }
-    LOG_INFO("[OBVSAG][cuVS] handed off GPU CAGRA graph to the first query", KP(key), K(n),
-             K(dim32), K(built), K(build_us));
-    return true;
-  }
   // 图大小的粗估：CAGRA 的内存形态约 = 邻接表(n * degree * 4) + 数据集(n * dim * 4)。
   // 只用来决定走 memfd 还是 tmpfile，估大一点也无害。
   const uint64_t est_graph_bytes = static_cast<uint64_t>(n) *
@@ -665,17 +782,21 @@ static int ob_cuvs_deserialize(void *key, int expected_dim, std::istream &in, bo
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("[OBVSAG][cuVS] truncated snapshot payload", K(ret), KP(key), K(n64));
     } else if (!has_graph) {
-      std::shared_ptr<void> handoff = ob_cuvs_handoff_take(token, n, dim32);
+      ObCuvsHandoffPayload handoff = ob_cuvs_handoff_take(token, n, dim32);
       ent->ids_ = ent->buf_ids_;
-      if (handoff != nullptr) {
-        ent->bridge_ = handoff;
-        ent->built_n_ = n;
+      std::shared_ptr<void> adopted_handle = handoff.bridge_;
+      if (adopted_handle == nullptr && handoff.fut_ != nullptr) {
+        adopted_handle = ob_cuvs_wait_build(handoff.fut_);  // DDL 期启动的后台建图可能还在跑
+      }
+      if (adopted_handle != nullptr) {
+        ent->bridge_ = adopted_handle;
+        ent->built_n_ = (handoff.fut_ != nullptr) ? handoff.fut_->n_ : n;
       } else {
         // No handle in this process: let the first query build CAGRA from the vectors.
         ent->built_n_ = 0;
       }
       ob_cuvs_publish(key, ent);
-      const bool adopted = (handoff != nullptr);
+      const bool adopted = (adopted_handle != nullptr);
       LOG_INFO("[OBVSAG][cuVS] deserialized handoff snapshot", KP(key), K(n64), K(dim32),
                K(adopted));
     } else {
@@ -2280,6 +2401,17 @@ long cuvs_knn_search_batch(void *key, const float *queries, long nq, long topk,
   if (it == g_ob_cuvs_reg.end()) { return 0; }
   ObCuvsEntry *ent = it->second;
   const size_t n = ent->buf_ids_.size();
+  // [AMD-CONTEST] 同单查询：先接手 DDL 期启动的后台建图。
+  if (ent->bridge_ == nullptr && ent->build_fut_ != nullptr) {
+    std::shared_ptr<void> built_handle = ob_cuvs_wait_build(ent->build_fut_);
+    if (built_handle != nullptr) {
+      ent->bridge_ = built_handle;
+      ent->built_n_ = ent->build_fut_n_;
+      ent->ids_ = ent->buf_ids_;
+    }
+    ent->build_fut_.reset();
+    ent->build_fut_n_ = 0;
+  }
   const bool need_build =
       (n >= OB_CUVS_MIN_PTS && (ent->bridge_ == nullptr || n >= ent->built_n_ * 2));
   std::vector<unsigned> off(static_cast<size_t>(nq) * topk);
