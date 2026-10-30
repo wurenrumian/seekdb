@@ -33,9 +33,24 @@ void* seekdb_cuvs_build(const float* base, long n, long dim)
 
   if (cuvsCagraIndexParamsCreate(&h->ip) != CUVS_SUCCESS) goto fail_res;
   h->ip->build_algo = NN_DESCENT;
-  h->ip->graph_degree = 128;
-  h->ip->intermediate_graph_degree = 256;
-  h->ip->nn_descent_niter = 100;
+  /* [AMD-CONTEST] Build-cost knob. The baseline caps NN-descent at 100 passes; the
+   * graph itself stays exactly as tuned for the recall gates (degree 128, 256-wide
+   * intermediate graph), only the number of refinement passes over that graph is
+   * lowered. NN-descent spends every pass re-scanning the same candidate lists and
+   * stops paying off long before 100, while the final 128-way graph still keeps far
+   * more good neighbours than the search needs. Resolved from the environment so it
+   * can be retuned without a rebuild; unset means 50.
+   */
+  {
+    const char *ni = getenv("OB_CUVS_NITER");
+    h->ip->graph_degree = 128;
+    h->ip->intermediate_graph_degree = 256;
+    h->ip->nn_descent_niter = ni ? atoi(ni) : 50;
+    if (h->ip->nn_descent_niter <= 0) h->ip->nn_descent_niter = 50;
+    fprintf(stderr, "[seekdb_cuvs] build params: n=%ld dim=%ld degree=%d intermediate=%d niter=%d\n",
+            n, dim, (int)h->ip->graph_degree, (int)h->ip->intermediate_graph_degree,
+            (int)h->ip->nn_descent_niter);
+  }
   if (cuvsCagraIndexCreate(&h->idx)      != CUVS_SUCCESS) goto fail_ip;
   if (cuvsCagraBuild(h->res, h->ip, &dset, h->idx) != CUVS_SUCCESS) goto fail_idx;
   h->n = n; h->dim = dim;

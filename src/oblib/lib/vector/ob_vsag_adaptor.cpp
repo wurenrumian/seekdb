@@ -105,6 +105,7 @@ struct ObCuvsEntry {
   size_t build_fut_n_ = 0;
   bool vsag_ready_ = false;     // CPU fallback is built only when it is needed
 };
+static const size_t OB_CUVS_MIN_PTS = 256;  // CAGRA needs a graph; below this -> VSAG
 static std::mutex g_ob_cuvs_mu;
 static std::map<void *, ObCuvsEntry *> g_ob_cuvs_reg;
 static std::mutex g_ob_cuvs_marked_mu;
@@ -142,7 +143,8 @@ static inline void ob_vsag_trace(const char *fn, const void *h, long a, long b) 
   std::lock_guard<std::mutex> guard(g_ob_vsag_trace_mu);
   FILE *tf = ::fopen(path, "a");
   if (tf == nullptr) { return; }
-  ::fprintf(tf, "%-14s handle=%p a=%ld b=%ld\n", fn, h, a, b);
+  ::fprintf(tf, "%-14s handle=%p a=%ld b=%ld t=%ld\n", fn, h, a, b,
+            static_cast<long>(::oceanbase::common::ObTimeUtility::current_time()));
   ::fclose(tf);
 #else
   (void)fn; (void)h; (void)a; (void)b;
@@ -261,6 +263,7 @@ static void ob_cuvs_add(void *key, const float *vectors, const int64_t *ids,
   slot->buf_vecs_.insert(slot->buf_vecs_.end(), vectors,
                          vectors + static_cast<size_t>(dim) * size);
   slot->buf_ids_.insert(slot->buf_ids_.end(), ids, ids + size);
+  ob_vsag_trace("cuvs_add", key, static_cast<long>(dim), static_cast<long>(size));
 }
 static bool ob_cuvs_vsag_ready(void *key) {
   std::lock_guard<std::mutex> guard(g_ob_cuvs_mu);
@@ -384,8 +387,6 @@ static uint64_t ob_cuvs_batch_fp(const float *base, long n, long dim) {
   return h;
 }
 }  // namespace
-
-static const size_t OB_CUVS_MIN_PTS = 256;  // CAGRA needs a graph; below this -> VSAG
 
 static bool ob_cuvs_try_search(void *key, vsag::Allocator *alloc,
                                const float *query, int /*dim*/, int64_t topk,
